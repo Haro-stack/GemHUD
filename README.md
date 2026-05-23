@@ -67,18 +67,22 @@ GET  /health
 POST /analyze
 ```
 
-Current Rust mode is `heuristic`, matching the first public-card value service.
-The reserved `dinoboard-native` mode documents the intended future integration,
-but it is not active yet:
+Current Rust mode defaults to `heuristic`, matching the first public-card value
+service. If you have built DinoBoard's native C ABI, `dinoboard-native` can load
+the DLL and use DinoBoard MCTS root action values:
 
 ```bash
-target\release\gemhud-advisor.exe --engine dinoboard-native --model path\to\splendor_2p.onnx
+target\release\gemhud-advisor.exe \
+  --engine dinoboard-native \
+  --dinoboard-dll D:\codex\Haro-DinoBoard\build-capi\dinoboard_c_api.dll \
+  --model D:\codex\Haro-DinoBoard\games\splendor\model\splendor_2p.onnx \
+  --simulations 96
 ```
 
-That mode returns `501 Not Implemented` until a native DinoBoard engine ABI is
-available. ONNX alone is not enough to run DinoBoard, because legal actions,
-feature encoding, hidden-information tracking, and MCTS live outside the ONNX
-network.
+This native mode still depends on a BGA public-state mapper for exact live-table
+accuracy. Until that mapper is complete, GemHUD maps visible base-card slots to
+DinoBoard root action values and falls back to the public-card heuristic when a
+card cannot be mapped.
 
 ## Current Status
 

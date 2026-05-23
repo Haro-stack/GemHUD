@@ -15,8 +15,18 @@ cargo build --release
 target\release\gemhud-advisor.exe --addr 127.0.0.1:8787
 ```
 
-It currently implements the public-card heuristic value service. It is useful
-for testing the browser-to-local bridge without starting Python.
+It implements the public-card heuristic value service and can also load the
+DinoBoard C ABI DLL:
+
+```bash
+target\release\gemhud-advisor.exe \
+  --engine dinoboard-native \
+  --dinoboard-dll D:\codex\Haro-DinoBoard\build-capi\dinoboard_c_api.dll \
+  --model D:\codex\Haro-DinoBoard\games\splendor\model\splendor_2p.onnx
+```
+
+The native mode calls DinoBoard's C++ engine through C ABI and returns
+values-only badges. It does not automate BGA moves.
 
 ## Why ONNX Alone Is Not Enough
 
@@ -39,6 +49,8 @@ available.
 ## Native DinoBoard Options
 
 ### Option A: C ABI From DinoBoard C++
+
+Status: initial session/create/decide ABI exists in Haro-stack/DinoBoard.
 
 Expose a small C ABI from DinoBoard:
 
@@ -67,6 +79,7 @@ Use PyInstaller or Nuitka to ship the existing Python/FastAPI service as an
 
 ## Recommended Path
 
-Use the Rust advisor executable now for low-friction GemHUD practice, then add
-Option A when the BGA base Splendor state mapper is validated. Keep the HTTP
-API stable so the userscript does not need to change.
+Use the Rust advisor executable now for low-friction GemHUD practice. Continue
+with Option A by adding DinoBoard observation/snapshot C ABI functions after
+the BGA base Splendor state mapper is validated. Keep the HTTP API stable so the
+userscript does not need to change.

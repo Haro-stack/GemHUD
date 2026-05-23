@@ -44,9 +44,13 @@ The response should keep the same `/analyze` shape used by the userscript.
 ## Rust Executable Adapter
 
 `rust-advisor/` is the preferred user-facing executable wrapper. It can serve
-the GemHUD API without Python today, and later call a native DinoBoard ABI.
+the GemHUD API without Python and can load DinoBoard's native C ABI DLL through
+`--engine dinoboard-native`.
 
 Do not treat `splendor_2p.onnx` as a complete standalone AI. ONNX stores only
 the policy/value network. The Rust adapter still needs DinoBoard's rules,
 feature encoder, legal action generator, observation tracker, and MCTS to
 produce correct card action values.
+
+Current native mode maps card slot action ids to DinoBoard root action values.
+Exact live BGA table values still require the snapshot mapper described above.
