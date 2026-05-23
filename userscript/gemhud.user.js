@@ -308,7 +308,28 @@
         raw_hint: source.slice(0, 1000),
       });
     });
+    annotateBaseSplendorActionIds(cards);
     return cards;
+  }
+
+  function annotateBaseSplendorActionIds(cards) {
+    const marketCards = cards.filter((card) => card.location !== "reserved" && card.location !== "noble");
+    const tierSlots = {};
+    marketCards.forEach((card, index) => {
+      let tierIndex = Number.isFinite(Number(card.tier)) ? Number(card.tier) - 1 : Math.floor(index / 4);
+      if (!Number.isFinite(tierIndex)) tierIndex = Math.floor(index / 4);
+      tierIndex = Math.max(0, Math.min(2, tierIndex));
+      const key = String(tierIndex);
+      const slot = tierSlots[key] || 0;
+      tierSlots[key] = slot + 1;
+      if (slot >= 4) return;
+      const marketIndex = tierIndex * 4 + slot;
+      card.market_index = marketIndex;
+      card.tier_index = tierIndex;
+      card.slot_index = slot;
+      card.buy_action_id = marketIndex;
+      card.reserve_action_id = 12 + marketIndex;
+    });
   }
 
   function inferLocation(el) {

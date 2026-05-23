@@ -2,20 +2,33 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::env;
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::ptr;
 use std::thread;
 
 const VERSION: &str = "0.1.0";
 const DEFAULT_ADDR: &str = "127.0.0.1:8787";
 const COLORS: [&str; 5] = ["white", "blue", "green", "red", "black"];
 
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn LoadLibraryA(name: *const c_char) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
+    fn FreeLibrary(module: *mut c_void) -> c_int;
+}
+
 #[derive(Debug, Clone)]
 struct Config {
     addr: String,
     engine: EngineMode,
     model_path: Option<PathBuf>,
+    dinoboard_dll: Option<PathBuf>,
+    simulations: i32,
+    seed: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +64,12 @@ struct CardInput {
     cost: HashMap<String, Value>,
     #[serde(default)]
     location: Option<String>,
+    #[serde(default)]
+    buy_action_id: Option<i64>,
+    #[serde(default)]
+    reserve_action_id: Option<i64>,
+    #[serde(default)]
+    market_index: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,6 +100,32 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
+type StringFree = unsafe extern "C" fn(*mut c_char);
+type Json0 = unsafe extern "C" fn() -> *mut c_char;
+type CreateSession =
+    unsafe extern "C" fn(*const c_char, *const c_char, u64, c_int, *mut *mut c_char) -> *mut c_void;
+type DestroySession = unsafe extern "C" fn(*mut c_void);
+type DecideJson =
+    unsafe extern "C" fn(*mut c_void, c_int, f64, c_int, *mut *mut c_char) -> *mut c_char;
+
+struct DinoBoardApi {
+    module: *mut c_void,
+    string_free: StringFree,
+    available_games_json: Json0,
+    session_create: CreateSession,
+    session_destroy: DestroySession,
+    session_decide_json: DecideJson,
+}
+
+impl Drop for DinoBoardApi {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe {
+            FreeLibrary(self.module);
+        }
+    }
+}
+
 fn main() {
     let config = match parse_config(env::args().skip(1).collect()) {
         Ok(config) => config,
@@ -97,6 +142,20 @@ fn main() {
             std::process::exit(2);
         }
     }
+    if config.engine == EngineMode::DinoBoardNative {
+        let Some(path) = &config.dinoboard_dll else {
+            eprintln!("--engine dinoboard-native requires --dinoboard-dll");
+            std::process::exit(2);
+        };
+        if !path.exists() {
+            eprintln!("DinoBoard C ABI DLL does not exist: {}", path.display());
+            std::process::exit(2);
+        }
+        if config.model_path.is_none() {
+            eprintln!("--engine dinoboard-native requires --model");
+            std::process::exit(2);
+        }
+    }
 
     let listener = TcpListener::bind(&config.addr).unwrap_or_else(|err| {
         panic!("failed to bind {}: {err}", config.addr);
@@ -107,7 +166,7 @@ fn main() {
         config.addr,
         match config.engine {
             EngineMode::Heuristic => "public-card heuristic",
-            EngineMode::DinoBoardNative => "DinoBoard native adapter placeholder",
+            EngineMode::DinoBoardNative => "DinoBoard C ABI native adapter",
         }
     );
 
@@ -130,6 +189,9 @@ fn parse_config(args: Vec<String>) -> Result<Config, String> {
     let mut addr = DEFAULT_ADDR.to_string();
     let mut engine = EngineMode::Heuristic;
     let mut model_path = None;
+    let mut dinoboard_dll = None;
+    let mut simulations = 96_i32;
+    let mut seed = 20260524_u64;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -158,6 +220,32 @@ fn parse_config(args: Vec<String>) -> Result<Config, String> {
                         .ok_or_else(|| "--model requires a value".to_string())?,
                 ));
             }
+            "--dinoboard-dll" => {
+                i += 1;
+                dinoboard_dll =
+                    Some(PathBuf::from(args.get(i).ok_or_else(|| {
+                        "--dinoboard-dll requires a value".to_string()
+                    })?));
+            }
+            "--simulations" => {
+                i += 1;
+                simulations = args
+                    .get(i)
+                    .ok_or_else(|| "--simulations requires a value".to_string())?
+                    .parse::<i32>()
+                    .map_err(|err| format!("invalid --simulations value: {err}"))?;
+                if simulations <= 0 {
+                    return Err("--simulations must be positive".to_string());
+                }
+            }
+            "--seed" => {
+                i += 1;
+                seed = args
+                    .get(i)
+                    .ok_or_else(|| "--seed requires a value".to_string())?
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid --seed value: {err}"))?;
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -170,16 +258,19 @@ fn parse_config(args: Vec<String>) -> Result<Config, String> {
         addr,
         engine,
         model_path,
+        dinoboard_dll,
+        simulations,
+        seed,
     })
 }
 
 fn print_usage() {
     eprintln!(
-        "Usage: gemhud-advisor [--addr 127.0.0.1:8787] [--engine heuristic|dinoboard-native] [--model path]\n\
+        "Usage: gemhud-advisor [--addr 127.0.0.1:8787] [--engine heuristic|dinoboard-native] [--model path] [--dinoboard-dll path]\n\
          \n\
          The current executable serves GemHUD's values-only /analyze API.\n\
-         The dinoboard-native engine mode is reserved for a future native DinoBoard ABI;\n\
-         ONNX alone is not enough to run DinoBoard MCTS."
+         dinoboard-native loads DinoBoard's C ABI DLL and uses ONNX/MCTS root values.\n\
+         It still needs a BGA snapshot mapper for fully accurate live-position values."
     );
 }
 
@@ -270,6 +361,8 @@ fn route(request: HttpRequest, config: &Config) -> String {
                 "automation": false,
                 "engine": engine_name(config.engine),
                 "model_path": config.model_path.as_ref().map(|p| p.display().to_string()),
+                "dinoboard_dll": config.dinoboard_dll.as_ref().map(|p| p.display().to_string()),
+                "simulations": config.simulations,
             }),
         ),
         ("POST", "/analyze") => analyze_route(&request.body, config),
@@ -324,24 +417,28 @@ fn analyze_route(body: &[u8], config: &Config) -> String {
             }),
         );
     }
-    if config.engine == EngineMode::DinoBoardNative {
-        return json_response(
-            501,
-            json!({
-                "ok": false,
-                "error": "dinoboard-native mode needs a native DinoBoard engine ABI. Loading ONNX alone cannot run legal actions, MCTS, or feature encoding.",
-            }),
-        );
-    }
-
     let mut warnings = Vec::new();
     if req.cards.is_empty() {
         warnings.push("No cards were detected in the request.".to_string());
     }
-    let cards = req.cards.iter().map(score_card).collect();
+    let cards = if config.engine == EngineMode::DinoBoardNative {
+        match score_cards_with_dinoboard(&req.cards, config, &mut warnings) {
+            Ok(cards) => cards,
+            Err(err) => {
+                warnings.push(format!("DinoBoard native unavailable: {err}"));
+                req.cards.iter().map(score_card).collect()
+            }
+        }
+    } else {
+        req.cards.iter().map(score_card).collect()
+    };
     let response = AnalyzeResponse {
         ok: true,
-        engine: "gemhud-rust-card-value-v0".to_string(),
+        engine: if config.engine == EngineMode::DinoBoardNative {
+            "gemhud-dinoboard-c-abi-v0".to_string()
+        } else {
+            "gemhud-rust-card-value-v0".to_string()
+        },
         version: VERSION.to_string(),
         game: "splendor_base".to_string(),
         scope: "public visible cards; values only; no action automation".to_string(),
@@ -352,6 +449,113 @@ fn analyze_route(body: &[u8], config: &Config) -> String {
         200,
         serde_json::to_value(response).unwrap_or_else(|_| json!({ "ok": false })),
     )
+}
+
+fn score_cards_with_dinoboard(
+    cards: &[CardInput],
+    config: &Config,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<CardValue>, String> {
+    let dll = config
+        .dinoboard_dll
+        .as_ref()
+        .ok_or_else(|| "--dinoboard-dll is required".to_string())?;
+    let model = config
+        .model_path
+        .as_ref()
+        .ok_or_else(|| "--model is required".to_string())?;
+    let api = unsafe { load_dinoboard_api(dll)? };
+    let model_c = CString::new(model.to_string_lossy().as_bytes())
+        .map_err(|_| "model path contains NUL byte".to_string())?;
+    let game_c = CString::new("splendor_2p").unwrap();
+    unsafe {
+        let mut err: *mut c_char = ptr::null_mut();
+        let session =
+            (api.session_create)(game_c.as_ptr(), model_c.as_ptr(), config.seed, 0, &mut err);
+        if session.is_null() {
+            return Err(take_error(err, api.string_free));
+        }
+        let raw = (api.session_decide_json)(session, config.simulations, 0.0, 1, &mut err);
+        (api.session_destroy)(session);
+        if raw.is_null() {
+            return Err(take_error(err, api.string_free));
+        }
+        let decide_json = owned_string(raw, api.string_free);
+        let parsed: Value = serde_json::from_str(&decide_json)
+            .map_err(|err| format!("invalid DinoBoard JSON: {err}"))?;
+        let _games_json = owned_string((api.available_games_json)(), api.string_free);
+        warnings.push(
+            "DinoBoard native mode is active. Values are mapped from DinoBoard root action values; full live BGA-state accuracy still depends on the snapshot mapper."
+                .to_string(),
+        );
+        Ok(cards
+            .iter()
+            .map(|card| score_card_with_dinoboard(card, &parsed))
+            .collect())
+    }
+}
+
+fn score_card_with_dinoboard(card: &CardInput, root: &Value) -> CardValue {
+    let buy = card
+        .buy_action_id
+        .and_then(|id| root_action_value(root, id))
+        .map(|v| ("buy", card.buy_action_id.unwrap(), v));
+    let reserve = card
+        .reserve_action_id
+        .and_then(|id| root_action_value(root, id))
+        .map(|v| ("reserve", card.reserve_action_id.unwrap(), v));
+    if let Some((kind, action_id, raw_value)) = best_action_value(buy, reserve) {
+        let value = clamp_f64((raw_value + 1.0) / 2.0, 0.0, 1.0);
+        return CardValue {
+            client_id: card.client_id.clone(),
+            value,
+            confidence: if card.market_index.is_some() {
+                0.75
+            } else {
+                0.55
+            },
+            method: "dinoboard-c-abi-root-action-value-v0".to_string(),
+            label: value_label(value).to_string(),
+            reasons: vec![
+                format!("{kind} action {action_id}"),
+                format!("root value {raw_value:.3}"),
+                "values only".to_string(),
+            ],
+        };
+    }
+    let mut fallback = score_card(card);
+    fallback.method = "public-card-heuristic-v0-no-dinoboard-action".to_string();
+    fallback
+        .reasons
+        .push("no mapped DinoBoard action".to_string());
+    fallback
+}
+
+fn best_action_value(
+    buy: Option<(&'static str, i64, f64)>,
+    reserve: Option<(&'static str, i64, f64)>,
+) -> Option<(&'static str, i64, f64)> {
+    match (buy, reserve) {
+        (Some(b), Some(r)) => {
+            if b.2 >= r.2 {
+                Some(b)
+            } else {
+                Some(r)
+            }
+        }
+        (Some(b), None) => Some(b),
+        (None, Some(r)) => Some(r),
+        (None, None) => None,
+    }
+}
+
+fn root_action_value(root: &Value, action_id: i64) -> Option<f64> {
+    let values = root
+        .get("stats")?
+        .get("action_values")?
+        .get(action_id.to_string())?
+        .as_array()?;
+    values.first()?.as_f64()
 }
 
 fn score_card(card: &CardInput) -> CardValue {
@@ -490,6 +694,57 @@ fn clamp_f64(value: f64, min: f64, max: f64) -> f64 {
     } else {
         min
     }
+}
+
+unsafe fn load_dinoboard_api(path: &PathBuf) -> Result<DinoBoardApi, String> {
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err("dinoboard-native is currently implemented for Windows DLL loading".to_string())
+    }
+    #[cfg(windows)]
+    {
+        let dll_c = CString::new(path.to_string_lossy().as_bytes())
+            .map_err(|_| "DLL path contains NUL byte".to_string())?;
+        let module = LoadLibraryA(dll_c.as_ptr());
+        if module.is_null() {
+            return Err(format!("LoadLibraryA failed for {}", path.display()));
+        }
+        Ok(DinoBoardApi {
+            module,
+            string_free: load_symbol(module, "dinoboard_string_free")?,
+            available_games_json: load_symbol(module, "dinoboard_available_games_json")?,
+            session_create: load_symbol(module, "dinoboard_session_create")?,
+            session_destroy: load_symbol(module, "dinoboard_session_destroy")?,
+            session_decide_json: load_symbol(module, "dinoboard_session_decide_json")?,
+        })
+    }
+}
+
+#[cfg(windows)]
+unsafe fn load_symbol<T>(module: *mut c_void, name: &str) -> Result<T, String> {
+    let cname = CString::new(name).unwrap();
+    let ptr = GetProcAddress(module, cname.as_ptr());
+    if ptr.is_null() {
+        return Err(format!("GetProcAddress failed for {name}"));
+    }
+    Ok(std::mem::transmute_copy(&ptr))
+}
+
+unsafe fn owned_string(ptr: *mut c_char, free_fn: StringFree) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let out = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+    free_fn(ptr);
+    out
+}
+
+unsafe fn take_error(ptr: *mut c_char, free_fn: StringFree) -> String {
+    if ptr.is_null() {
+        return "unknown error".to_string();
+    }
+    owned_string(ptr, free_fn)
 }
 
 fn default_game() -> String {
