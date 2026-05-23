@@ -21,6 +21,7 @@ foundation used by this project direction.
 
 ```text
 advisor/                 Local FastAPI value service
+rust-advisor/            Rust executable local value service
 userscript/              Tampermonkey userscript for BGA
 docs/                    Scope, safety, and integration notes
 ```
@@ -48,6 +49,36 @@ docs/                    Scope, safety, and integration notes
    ```
 
 5. The script renders value badges on detected visible cards.
+
+## Rust Advisor Executable
+
+If you do not want to start Python, GemHUD also includes a native Rust advisor:
+
+```bash
+cd rust-advisor
+cargo build --release
+target\release\gemhud-advisor.exe --addr 127.0.0.1:8787
+```
+
+The Rust executable serves the same local values-only API:
+
+```text
+GET  /health
+POST /analyze
+```
+
+Current Rust mode is `heuristic`, matching the first public-card value service.
+The reserved `dinoboard-native` mode documents the intended future integration,
+but it is not active yet:
+
+```bash
+target\release\gemhud-advisor.exe --engine dinoboard-native --model path\to\splendor_2p.onnx
+```
+
+That mode returns `501 Not Implemented` until a native DinoBoard engine ABI is
+available. ONNX alone is not enough to run DinoBoard, because legal actions,
+feature encoding, hidden-information tracking, and MCTS live outside the ONNX
+network.
 
 ## Current Status
 

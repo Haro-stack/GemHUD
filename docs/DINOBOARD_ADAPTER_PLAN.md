@@ -40,3 +40,13 @@ The response should keep the same `/analyze` shape used by the userscript.
 - Do not expose a move execution endpoint.
 - Do not support expansion tables until a separate `splendor_sns_2p` DinoBoard
   rules engine and BGA converter exist.
+
+## Rust Executable Adapter
+
+`rust-advisor/` is the preferred user-facing executable wrapper. It can serve
+the GemHUD API without Python today, and later call a native DinoBoard ABI.
+
+Do not treat `splendor_2p.onnx` as a complete standalone AI. ONNX stores only
+the policy/value network. The Rust adapter still needs DinoBoard's rules,
+feature encoder, legal action generator, observation tracker, and MCTS to
+produce correct card action values.
