@@ -108,6 +108,8 @@ struct AnalyzeResponse {
     warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recommendation: Option<ActionRecommendation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    recommendations: Vec<ActionRecommendation>,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,7 +122,7 @@ struct CardValue {
     reasons: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ActionRecommendation {
     label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,7 +136,7 @@ struct ActionRecommendation {
 
 struct NativeAnalysis {
     cards: Vec<CardValue>,
-    recommendation: Option<ActionRecommendation>,
+    recommendations: Vec<ActionRecommendation>,
 }
 
 #[derive(Debug)]
@@ -679,14 +681,14 @@ fn analyze_route(body: &[u8], config: &Config) -> String {
         engine_name(config.engine),
         config.simulations
     );
-    let (cards, recommendation) = if config.engine == EngineMode::DinoBoardNative {
+    let (cards, recommendations) = if config.engine == EngineMode::DinoBoardNative {
         match score_cards_with_dinoboard(
             &req.cards,
             config,
             &mut warnings,
             req.dinoboard_snapshot.as_ref(),
         ) {
-            Ok(analysis) => (analysis.cards, analysis.recommendation),
+            Ok(analysis) => (analysis.cards, analysis.recommendations),
             Err(err) => {
                 warnings.push(format!("DinoBoard native unavailable: {err}"));
                 let cards = req
@@ -701,7 +703,7 @@ fn analyze_route(body: &[u8], config: &Config) -> String {
                     .collect();
                 (
                     cards,
-                    recommend_action_from_snapshot(req.dinoboard_snapshot.as_ref(), &req.cards),
+                    recommendations_from_snapshot(req.dinoboard_snapshot.as_ref(), &req.cards),
                 )
             }
         }
@@ -718,17 +720,19 @@ fn analyze_route(body: &[u8], config: &Config) -> String {
             .collect();
         (
             cards,
-            recommend_action_from_snapshot(req.dinoboard_snapshot.as_ref(), &req.cards),
+            recommendations_from_snapshot(req.dinoboard_snapshot.as_ref(), &req.cards),
         )
     };
+    let recommendation = recommendations.first().cloned();
     let recommendation_label = recommendation
         .as_ref()
         .map(|item| item.label.as_str())
         .unwrap_or("-");
     println!(
-        "Analyze result: cards={}, recommendation={}, warnings={}, elapsed={}ms",
+        "Analyze result: cards={}, recommendation={}, recommendations={}, warnings={}, elapsed={}ms",
         cards.len(),
         recommendation_label,
+        recommendations.len(),
         warnings.len(),
         analyze_started.elapsed().as_millis()
     );
@@ -745,6 +749,7 @@ fn analyze_route(body: &[u8], config: &Config) -> String {
         cards,
         warnings,
         recommendation,
+        recommendations,
     };
     json_response(
         200,
@@ -825,7 +830,7 @@ fn score_cards_with_dinoboard(
                 .iter()
                 .map(|card| score_card_with_dinoboard(card, &parsed))
                 .collect(),
-            recommendation: recommend_action_from_root(&parsed),
+            recommendations: recommend_actions_from_root(&parsed, 3),
         })
     }
 }
@@ -907,41 +912,76 @@ fn root_action_value(root: &Value, action_id: i64) -> Option<f64> {
     values.first()?.as_f64()
 }
 
-fn recommend_action_from_root(root: &Value) -> Option<ActionRecommendation> {
-    let actions = root.get("stats")?.get("root_actions")?.as_array()?;
-    let mut best: Option<(i64, f64)> = None;
-    for action in actions.iter().filter_map(value_to_i64) {
-        let raw = root_action_value(root, action).unwrap_or_else(|| {
-            root.get("stats")
-                .and_then(|stats| stats.get("root_values"))
-                .and_then(Value::as_array)
-                .and_then(|values| {
-                    actions
-                        .iter()
-                        .position(|item| value_to_i64(item) == Some(action))
-                        .and_then(|idx| values.get(idx))
-                })
-                .and_then(Value::as_f64)
-                .unwrap_or(-1.0)
-        });
-        if best.map(|(_, value)| raw > value).unwrap_or(true) {
-            best = Some((action, raw));
-        }
-    }
-    let (action, raw_value) = best?;
-    let value = clamp_f64((raw_value + 1.0) / 2.0, 0.0, 1.0);
-    Some(ActionRecommendation {
-        label: label_action_id(action),
-        action_id: Some(action),
-        value: Some(value),
-        confidence: 0.78,
-        method: "dinoboard-c-abi-root-action-value-v0".to_string(),
-        reasons: vec![
-            format!("root action {action}"),
-            format!("root value {raw_value:.3}"),
-            "values only; no automation".to_string(),
-        ],
+fn recommend_actions_from_root(root: &Value, limit: usize) -> Vec<ActionRecommendation> {
+    let Some(actions) = root
+        .get("stats")
+        .and_then(|stats| stats.get("root_actions"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut ranked: Vec<(i64, f64)> = actions
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, item)| {
+            let action = value_to_i64(item)?;
+            let raw = root_action_rank_value(root, actions, idx, action);
+            Some((action, raw))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(action, raw_value)| {
+            let value = clamp_f64((raw_value + 1.0) / 2.0, 0.0, 1.0);
+            ActionRecommendation {
+                label: label_action_id_detailed(action),
+                action_id: Some(action),
+                value: Some(value),
+                confidence: 0.78,
+                method: "dinoboard-c-abi-root-action-value-v0".to_string(),
+                reasons: vec![
+                    format!("root action {action}"),
+                    format!("root value {raw_value:.3}"),
+                    "ranked by MCTS root action value".to_string(),
+                    "values only; no automation".to_string(),
+                ],
+            }
+        })
+        .collect()
+}
+
+fn root_action_rank_value(root: &Value, actions: &[Value], idx: usize, action: i64) -> f64 {
+    root_action_value(root, action).unwrap_or_else(|| {
+        root.get("stats")
+            .and_then(|stats| stats.get("root_values"))
+            .and_then(Value::as_array)
+            .and_then(|values| values.get(idx))
+            .and_then(Value::as_f64)
+            .or_else(|| {
+                actions
+                    .iter()
+                    .position(|item| value_to_i64(item) == Some(action))
+                    .and_then(|pos| {
+                        root.get("stats")
+                            .and_then(|stats| stats.get("root_values"))
+                            .and_then(Value::as_array)
+                            .and_then(|values| values.get(pos))
+                            .and_then(Value::as_f64)
+                    })
+            })
+            .unwrap_or(-1.0)
     })
+}
+
+fn recommendations_from_snapshot(
+    snapshot: Option<&Value>,
+    cards: &[CardInput],
+) -> Vec<ActionRecommendation> {
+    recommend_action_from_snapshot(snapshot, cards)
+        .into_iter()
+        .collect()
 }
 
 fn recommend_action_from_snapshot(
@@ -1058,11 +1098,42 @@ fn suggested_gems_for_card(
             return vec![color_short(idx).to_string(), color_short(idx).to_string()];
         }
     }
-    needed
+    let mut chosen: Vec<usize> = needed.into_iter().take(3).map(|(idx, _)| idx).collect();
+    if chosen.len() < 3 {
+        let mut fillers: Vec<usize> = (0..COLORS.len())
+            .filter(|idx| {
+                !chosen.contains(idx)
+                    && bank.get(*idx).copied().unwrap_or(0) > 0
+                    && !is_overstocked_color(*idx, gems)
+            })
+            .collect();
+        fillers.sort_by_key(|idx| cost.get(*idx).copied().unwrap_or(0));
+        fillers.reverse();
+        for idx in fillers {
+            chosen.push(idx);
+            if chosen.len() >= 3 {
+                break;
+            }
+        }
+    }
+    if chosen.len() < 3 {
+        for idx in 0..COLORS.len() {
+            if !chosen.contains(&idx) && bank.get(idx).copied().unwrap_or(0) > 0 {
+                chosen.push(idx);
+                if chosen.len() >= 3 {
+                    break;
+                }
+            }
+        }
+    }
+    chosen
         .into_iter()
-        .take(3)
-        .map(|(idx, _)| color_short(idx).to_string())
+        .map(|idx| color_short(idx).to_string())
         .collect()
+}
+
+fn is_overstocked_color(idx: usize, gems: &[i64]) -> bool {
+    gems.get(idx).copied().unwrap_or(0) >= 3
 }
 
 fn color_short(idx: usize) -> &'static str {
@@ -1074,6 +1145,72 @@ fn color_short(idx: usize) -> &'static str {
         4 => "B",
         _ => "?",
     }
+}
+
+fn label_action_id_detailed(action: i64) -> String {
+    match action {
+        0..=11 => format!("购买 T{} 第{}张", action / 4 + 1, action % 4 + 1),
+        12..=23 => {
+            let slot = action - 12;
+            format!("预定 T{} 第{}张", slot / 4 + 1, slot % 4 + 1)
+        }
+        24..=26 => format!("预定 T{} 牌堆", action - 23),
+        27..=29 => format!("购买预定牌{}", action - 26),
+        30..=39 => take_three_combo((action - 30) as usize)
+            .map(|colors| format!("拿宝石 {}", colors_label(&colors)))
+            .unwrap_or_else(|| "拿三种宝石".to_string()),
+        40..=49 => take_two_different_combo((action - 40) as usize)
+            .map(|colors| format!("拿宝石 {}", colors_label(&colors)))
+            .unwrap_or_else(|| "拿两种宝石".to_string()),
+        50..=54 => format!("拿宝石 {}", color_short((action - 50) as usize)),
+        55..=59 => {
+            let color = color_short((action - 55) as usize);
+            format!("拿宝石 {color} {color}")
+        }
+        60..=64 => format!("选择贵族{}", action - 59),
+        65..=70 => format!("弃宝石 {}", color_short((action - 65) as usize)),
+        _ => "执行最高价值合法动作".to_string(),
+    }
+}
+
+fn take_three_combo(index: usize) -> Option<[usize; 3]> {
+    const COMBOS: [[usize; 3]; 10] = [
+        [0, 1, 2],
+        [0, 1, 3],
+        [0, 1, 4],
+        [0, 2, 3],
+        [0, 2, 4],
+        [0, 3, 4],
+        [1, 2, 3],
+        [1, 2, 4],
+        [1, 3, 4],
+        [2, 3, 4],
+    ];
+    COMBOS.get(index).copied()
+}
+
+fn take_two_different_combo(index: usize) -> Option<[usize; 2]> {
+    const COMBOS: [[usize; 2]; 10] = [
+        [0, 1],
+        [0, 2],
+        [0, 3],
+        [0, 4],
+        [1, 2],
+        [1, 3],
+        [1, 4],
+        [2, 3],
+        [2, 4],
+        [3, 4],
+    ];
+    COMBOS.get(index).copied()
+}
+
+fn colors_label<const N: usize>(colors: &[usize; N]) -> String {
+    colors
+        .iter()
+        .map(|idx| color_short(*idx))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn short_card_label(card: &CardInput) -> String {
@@ -1097,6 +1234,7 @@ fn short_card_reason(card: &CardInput) -> String {
     )
 }
 
+#[allow(dead_code)]
 fn label_action_id(action: i64) -> String {
     match action {
         0..=11 => format!("购买 T{} 第{}张", action / 4 + 1, action % 4 + 1),

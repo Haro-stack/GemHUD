@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GemHUD - BGA Splendor Card Values
 // @namespace    https://github.com/Haro-stack/GemHUD
-// @version      0.1.0
+// @version      0.1.1
 // @description  Read public BGA base Splendor card information and display local advisor value badges. Values only; no move automation.
 // @author       Haro-stack
 // @match        https://boardgamearena.com/*
@@ -19,7 +19,7 @@
   "use strict";
 
   const APP = "GemHUD";
-  const VERSION = "0.1.0";
+  const VERSION = "0.1.1";
   const DEFAULT_ENDPOINT = "http://127.0.0.1:8787/analyze";
   const STORAGE_ENDPOINT = "gemhud.endpoint";
   const STORAGE_ENABLED = "gemhud.enabled";
@@ -221,6 +221,8 @@
         border: 1px solid rgba(128, 197, 231, 0.24);
         color: #dff5ff;
         font-weight: 700;
+        line-height: 1.45;
+        white-space: pre-line;
       }
       #gemhud-panel .gemhud-note {
         color: #9db1bc;
@@ -1300,20 +1302,28 @@
   function renderRecommendation(response) {
     const el = document.querySelector("#gemhud-reco");
     if (!el) return;
-    const recommendation = response && response.recommendation;
-    if (!recommendation || !recommendation.label) {
+    const recommendations = Array.isArray(response && response.recommendations) && response.recommendations.length
+      ? response.recommendations
+      : (response && response.recommendation ? [response.recommendation] : []);
+    const visible = recommendations.filter((item) => item && item.label).slice(0, 3);
+    if (!visible.length) {
       el.textContent = "建议: -";
       el.title = "";
       return;
     }
-    const value = Number(recommendation.value);
-    const suffix = Number.isFinite(value) ? ` (${Math.round(value * 100)})` : "";
-    el.textContent = `建议: ${recommendation.label}${suffix}`;
-    el.title = [
-      recommendation.method || "advisor",
-      ...(Array.isArray(recommendation.reasons) ? recommendation.reasons : []),
+    const lines = visible.map((item, index) => {
+      const value = Number(item.value);
+      const suffix = Number.isFinite(value) ? ` (${Math.round(value * 100)})` : "";
+      return `${index + 1}. ${item.label}${suffix}`;
+    });
+    el.textContent = `建议:\n${lines.join("\n")}`;
+    el.title = visible.flatMap((item, index) => [
+      `${index + 1}. ${item.label}`,
+      item.method || "advisor",
+      ...(Array.isArray(item.reasons) ? item.reasons : []),
+    ]).concat([
       "Values only; no automatic moves.",
-    ].filter(Boolean).join("\n");
+    ]).filter(Boolean).join("\n");
   }
 
   async function runScan(reason) {
@@ -1341,7 +1351,6 @@
     setStatus(`Sending ${payload.dom_card_count} cards, ${payload.carddb_card_count || 0} from carddb, snapshot ${payload.dinoboard_snapshot ? "mapped" : "missing"}`);
     try {
       const response = await postJson(endpoint(), payload);
-      if (seq !== scanSeq) return;
       const count = renderBadges(response);
       renderRecommendation(response);
       const mode = response && response.engine ? response.engine : "advisor";

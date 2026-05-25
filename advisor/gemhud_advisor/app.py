@@ -99,6 +99,7 @@ class AnalyzeResponse(BaseModel):
     cards: list[CardValue]
     warnings: list[str] = Field(default_factory=list)
     recommendation: ActionRecommendation | None = None
+    recommendations: list[ActionRecommendation] = Field(default_factory=list)
 
 
 app = FastAPI(
@@ -159,6 +160,7 @@ def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
         for card in req.cards
         if card.source != "gamedatas" or card.client_id
     ]
+    recommendations = recommend_actions(req.dinoboard_snapshot, req.cards)
     return AnalyzeResponse(
         engine="gemhud-card-value-v0",
         version=__version__,
@@ -166,7 +168,8 @@ def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
         scope="public visible cards; values only; no action automation",
         cards=values,
         warnings=warnings,
-        recommendation=recommend_action(req.dinoboard_snapshot, req.cards),
+        recommendation=recommendations[0] if recommendations else None,
+        recommendations=recommendations,
     )
 
 
@@ -339,6 +342,11 @@ def advances_visible_noble(card: CardInput, snapshot: dict[str, Any], bonuses: l
     return False
 
 
+def recommend_actions(snapshot: dict[str, Any] | None, cards: list[CardInput]) -> list[ActionRecommendation]:
+    first = recommend_action(snapshot, cards)
+    return [first] if first else []
+
+
 def recommend_action(snapshot: dict[str, Any] | None, cards: list[CardInput]) -> ActionRecommendation | None:
     if not snapshot:
         return None
@@ -390,15 +398,34 @@ def recommend_action(snapshot: dict[str, Any] | None, cards: list[CardInput]) ->
 
 
 def suggested_gems_for_card(card: CardInput, bonuses: list[int], gems: list[int], bank: list[int]) -> list[str]:
+    cost = [int(card.cost.get(color, 0)) for color in COLORS]
     needed: list[tuple[int, int]] = []
     for idx, color in enumerate(COLORS):
-        need = max(0, int(card.cost.get(color, 0)) - bonuses[idx] - gems[idx])
+        need = max(0, cost[idx] - bonuses[idx] - gems[idx])
         if need > 0 and bank[idx] > 0:
             needed.append((idx, need))
     needed.sort(key=lambda item: item[1], reverse=True)
     if needed and needed[0][1] >= 2 and bank[needed[0][0]] >= 4:
         return [color_short(needed[0][0]), color_short(needed[0][0])]
-    return [color_short(idx) for idx, _ in needed[:3]]
+    chosen = [idx for idx, _ in needed[:3]]
+    if len(chosen) < 3:
+        fillers = [
+            idx
+            for idx in range(len(COLORS))
+            if idx not in chosen and bank[idx] > 0 and gems[idx] < 3
+        ]
+        fillers.sort(key=lambda idx: cost[idx], reverse=True)
+        for idx in fillers:
+            chosen.append(idx)
+            if len(chosen) >= 3:
+                break
+    if len(chosen) < 3:
+        for idx in range(len(COLORS)):
+            if idx not in chosen and bank[idx] > 0:
+                chosen.append(idx)
+                if len(chosen) >= 3:
+                    break
+    return [color_short(idx) for idx in chosen]
 
 
 def color_short(idx: int) -> str:
