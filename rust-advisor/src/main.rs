@@ -2268,6 +2268,60 @@ fn json_response(status: u16, body: Value) -> String {
 mod tests {
     use super::*;
 
+    fn test_config() -> Config {
+        Config {
+            addr: DEFAULT_ADDR.to_string(),
+            engine: EngineMode::Heuristic,
+            model_path: None,
+            dinoboard_dll: None,
+            simulations: DEFAULT_SIMULATIONS,
+            seed: DEFAULT_SEED,
+        }
+    }
+
+    fn status_turns_from_analyze(source: &str) -> i64 {
+        let body = json!({
+            "source": source,
+            "game": "splendor_base",
+            "capabilities": {
+                "values_only": true,
+                "automation": false
+            },
+            "cards": [{
+                "client_id": format!("{source}:card-7"),
+                "tier": 3,
+                "points": 4,
+                "bonus_color": "white",
+                "cost": {"black": 7},
+                "market_index": 0,
+                "buy_action_id": 0,
+                "reserve_action_id": 12
+            }],
+            "dinoboard_snapshot": {
+                "schema": "gemhud-dinoboard-splendor-public-snapshot-v1",
+                "supported": true,
+                "current_player": 0,
+                "bank": [4, 4, 4, 4, 4, 5],
+                "players": [
+                    {"tokens": [0, 0, 0, 0, 0, 0], "bonuses": [0, 0, 0, 0, 0], "reserved": []},
+                    {"tokens": [0, 0, 0, 0, 0, 0], "bonuses": [0, 0, 0, 0, 0], "reserved": []}
+                ],
+                "market": [[
+                    {"tier": 1, "slot": 0, "points": 4, "bonus_color": "white", "cost": [0, 0, 0, 0, 7]}
+                ], [], []],
+                "nobles": []
+            }
+        });
+        let response = analyze_route(body.to_string().as_bytes(), &test_config());
+        let (_, json_body) = response
+            .split_once("\r\n\r\n")
+            .expect("HTTP response should contain a body");
+        let parsed: Value = serde_json::from_str(json_body).expect("valid analyze JSON");
+        parsed["cards"][0]["self_status"]["turns_to_buy"]
+            .as_i64()
+            .expect("turn estimate should be present")
+    }
+
     #[test]
     fn single_color_deficit_counts_one_per_turn() {
         assert_eq!(
@@ -2294,5 +2348,11 @@ mod tests {
             min_turns_to_cover_deficits(&[3, 3, 0, 0, 0], &[4, 4, 4, 4, 4, 5]),
             3
         );
+    }
+
+    #[test]
+    fn bga_and_hullqin_payloads_share_turn_estimate() {
+        assert_eq!(status_turns_from_analyze("bga"), 7);
+        assert_eq!(status_turns_from_analyze("hullqin-ccbs"), 7);
     }
 }
