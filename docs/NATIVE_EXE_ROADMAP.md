@@ -25,8 +25,9 @@ target\release\gemhud-advisor.exe \
   --model D:\codex\Haro-DinoBoard\games\splendor\model\splendor_2p.onnx
 ```
 
-The native mode calls DinoBoard's C++ engine through C ABI and returns
-values-only badges. It does not automate BGA moves.
+The native mode calls DinoBoard's C++ engine through C ABI, applies mapped BGA
+base Splendor public snapshots when available, and returns values-only badges.
+It does not automate BGA moves.
 
 ## Why ONNX Alone Is Not Enough
 
@@ -50,15 +51,18 @@ available.
 
 ### Option A: C ABI From DinoBoard C++
 
-Status: initial session/create/decide ABI exists in Haro-stack/DinoBoard.
+Status: session/create/decide plus low-level state and visibility setters exist
+in Haro-stack/DinoBoard.
 
-Expose a small C ABI from DinoBoard:
+The native bridge uses a small C ABI from DinoBoard:
 
 ```c
-void* dinoboard_create_session(const char* game_id, const char* model_path);
-int dinoboard_apply_snapshot(void* session, const char* json_snapshot);
-int dinoboard_analyze(void* session, const char* json_request, char* out_json, int out_len);
-void dinoboard_destroy_session(void* session);
+void* dinoboard_session_create(const char* game_id, const char* model_path, ...);
+int dinoboard_session_set_int_field(void* session, const char* field, ...);
+int dinoboard_session_set_viz_field(void* session, const char* field, ...);
+int dinoboard_session_rebuild_views(void* session, char** out_error);
+char* dinoboard_session_decide_json(void* session, ...);
+void dinoboard_session_destroy(void* session);
 ```
 
 Then Rust can load that library and serve GemHUD's HTTP API without Python.
@@ -79,7 +83,6 @@ Use PyInstaller or Nuitka to ship the existing Python/FastAPI service as an
 
 ## Recommended Path
 
-Use the Rust advisor executable now for low-friction GemHUD practice. Continue
-with Option A by adding DinoBoard observation/snapshot C ABI functions after
-the BGA base Splendor state mapper is validated. Keep the HTTP API stable so the
-userscript does not need to change.
+Use the Rust advisor executable for low-friction GemHUD practice. Keep the HTTP
+API stable, and add separate DinoBoard rule/model support before enabling
+Orient, Strongholds, Cities, or Sun Never Sets tables.

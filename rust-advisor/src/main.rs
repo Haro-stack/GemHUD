@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::io::{Read, Write};
@@ -45,6 +45,8 @@ struct AnalyzeRequest {
     capabilities: HashMap<String, Value>,
     #[serde(default)]
     cards: Vec<CardInput>,
+    #[serde(default)]
+    dinoboard_snapshot: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +83,8 @@ struct AnalyzeResponse {
     scope: String,
     cards: Vec<CardValue>,
     warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recommendation: Option<ActionRecommendation>,
 }
 
 #[derive(Debug, Serialize)]
@@ -91,6 +95,23 @@ struct CardValue {
     method: String,
     label: String,
     reasons: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ActionRecommendation {
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<f64>,
+    confidence: f64,
+    method: String,
+    reasons: Vec<String>,
+}
+
+struct NativeAnalysis {
+    cards: Vec<CardValue>,
+    recommendation: Option<ActionRecommendation>,
 }
 
 #[derive(Debug)]
@@ -105,6 +126,24 @@ type Json0 = unsafe extern "C" fn() -> *mut c_char;
 type CreateSession =
     unsafe extern "C" fn(*const c_char, *const c_char, u64, c_int, *mut *mut c_char) -> *mut c_void;
 type DestroySession = unsafe extern "C" fn(*mut c_void);
+type SetIntField = unsafe extern "C" fn(
+    *mut c_void,
+    *const c_char,
+    *const c_int,
+    c_int,
+    c_int,
+    *mut *mut c_char,
+) -> c_int;
+type SetVizField = unsafe extern "C" fn(
+    *mut c_void,
+    *const c_char,
+    *const c_int,
+    c_int,
+    c_int,
+    c_int,
+    *mut *mut c_char,
+) -> c_int;
+type RebuildViews = unsafe extern "C" fn(*mut c_void, *mut *mut c_char) -> c_int;
 type DecideJson =
     unsafe extern "C" fn(*mut c_void, c_int, f64, c_int, *mut *mut c_char) -> *mut c_char;
 
@@ -114,7 +153,27 @@ struct DinoBoardApi {
     available_games_json: Json0,
     session_create: CreateSession,
     session_destroy: DestroySession,
+    session_set_int_field: SetIntField,
+    session_set_viz_field: SetVizField,
+    session_rebuild_views: RebuildViews,
     session_decide_json: DecideJson,
+    splendor_card_pool_json: Json0,
+    splendor_nobles_json: Json0,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DinoCardDef {
+    id: i64,
+    tier: i64,
+    bonus: i64,
+    points: i64,
+    cost: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DinoNobleDef {
+    id: i64,
+    requirements: Vec<i64>,
 }
 
 impl Drop for DinoBoardApi {
@@ -421,16 +480,50 @@ fn analyze_route(body: &[u8], config: &Config) -> String {
     if req.cards.is_empty() {
         warnings.push("No cards were detected in the request.".to_string());
     }
-    let cards = if config.engine == EngineMode::DinoBoardNative {
-        match score_cards_with_dinoboard(&req.cards, config, &mut warnings) {
-            Ok(cards) => cards,
+    if let Some(snapshot) = &req.dinoboard_snapshot {
+        append_snapshot_warnings(snapshot, &mut warnings);
+    }
+    let (cards, recommendation) = if config.engine == EngineMode::DinoBoardNative {
+        match score_cards_with_dinoboard(
+            &req.cards,
+            config,
+            &mut warnings,
+            req.dinoboard_snapshot.as_ref(),
+        ) {
+            Ok(analysis) => (analysis.cards, analysis.recommendation),
             Err(err) => {
                 warnings.push(format!("DinoBoard native unavailable: {err}"));
-                req.cards.iter().map(score_card).collect()
+                let cards = req
+                    .cards
+                    .iter()
+                    .map(|card| {
+                        req.dinoboard_snapshot
+                            .as_ref()
+                            .map(|snapshot| score_card_with_snapshot(card, snapshot))
+                            .unwrap_or_else(|| score_card(card))
+                    })
+                    .collect();
+                (
+                    cards,
+                    recommend_action_from_snapshot(req.dinoboard_snapshot.as_ref(), &req.cards),
+                )
             }
         }
     } else {
-        req.cards.iter().map(score_card).collect()
+        let cards = req
+            .cards
+            .iter()
+            .map(|card| {
+                req.dinoboard_snapshot
+                    .as_ref()
+                    .map(|snapshot| score_card_with_snapshot(card, snapshot))
+                    .unwrap_or_else(|| score_card(card))
+            })
+            .collect();
+        (
+            cards,
+            recommend_action_from_snapshot(req.dinoboard_snapshot.as_ref(), &req.cards),
+        )
     };
     let response = AnalyzeResponse {
         ok: true,
@@ -444,6 +537,7 @@ fn analyze_route(body: &[u8], config: &Config) -> String {
         scope: "public visible cards; values only; no action automation".to_string(),
         cards,
         warnings,
+        recommendation,
     };
     json_response(
         200,
@@ -455,7 +549,8 @@ fn score_cards_with_dinoboard(
     cards: &[CardInput],
     config: &Config,
     warnings: &mut Vec<String>,
-) -> Result<Vec<CardValue>, String> {
+    snapshot: Option<&Value>,
+) -> Result<NativeAnalysis, String> {
     let dll = config
         .dinoboard_dll
         .as_ref()
@@ -467,13 +562,35 @@ fn score_cards_with_dinoboard(
     let api = unsafe { load_dinoboard_api(dll)? };
     let model_c = CString::new(model.to_string_lossy().as_bytes())
         .map_err(|_| "model path contains NUL byte".to_string())?;
-    let game_c = CString::new("splendor_2p").unwrap();
+    let game_id = snapshot
+        .and_then(|value| value.get("game_id").and_then(Value::as_str))
+        .unwrap_or("splendor_2p");
+    let game_c = CString::new(game_id).map_err(|_| "game_id contains NUL byte".to_string())?;
     unsafe {
         let mut err: *mut c_char = ptr::null_mut();
         let session =
             (api.session_create)(game_c.as_ptr(), model_c.as_ptr(), config.seed, 0, &mut err);
         if session.is_null() {
             return Err(take_error(err, api.string_free));
+        }
+        if let Some(snapshot) = snapshot {
+            if !snapshot
+                .get("supported")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+            {
+                (api.session_destroy)(session);
+                return Err(
+                    "snapshot includes unsupported expansion data for the base DinoBoard model"
+                        .to_string(),
+                );
+            }
+            if let Err(err) =
+                apply_splendor_snapshot_to_dinoboard(&api, session, snapshot, warnings)
+            {
+                (api.session_destroy)(session);
+                return Err(err);
+            }
         }
         let raw = (api.session_decide_json)(session, config.simulations, 0.0, 1, &mut err);
         (api.session_destroy)(session);
@@ -484,14 +601,24 @@ fn score_cards_with_dinoboard(
         let parsed: Value = serde_json::from_str(&decide_json)
             .map_err(|err| format!("invalid DinoBoard JSON: {err}"))?;
         let _games_json = owned_string((api.available_games_json)(), api.string_free);
-        warnings.push(
-            "DinoBoard native mode is active. Values are mapped from DinoBoard root action values; full live BGA-state accuracy still depends on the snapshot mapper."
-                .to_string(),
-        );
-        Ok(cards
-            .iter()
-            .map(|card| score_card_with_dinoboard(card, &parsed))
-            .collect())
+        if snapshot.is_some() {
+            warnings.push(
+                "DinoBoard native mode applied the mapped BGA public snapshot before MCTS."
+                    .to_string(),
+            );
+        } else {
+            warnings.push(
+                "DinoBoard native mode is active without a BGA snapshot, so values use the initial generated state."
+                    .to_string(),
+            );
+        }
+        Ok(NativeAnalysis {
+            cards: cards
+                .iter()
+                .map(|card| score_card_with_dinoboard(card, &parsed))
+                .collect(),
+            recommendation: recommend_action_from_root(&parsed),
+        })
     }
 }
 
@@ -556,6 +683,808 @@ fn root_action_value(root: &Value, action_id: i64) -> Option<f64> {
         .get(action_id.to_string())?
         .as_array()?;
     values.first()?.as_f64()
+}
+
+fn recommend_action_from_root(root: &Value) -> Option<ActionRecommendation> {
+    let actions = root.get("stats")?.get("root_actions")?.as_array()?;
+    let mut best: Option<(i64, f64)> = None;
+    for action in actions.iter().filter_map(value_to_i64) {
+        let raw = root_action_value(root, action).unwrap_or_else(|| {
+            root.get("stats")
+                .and_then(|stats| stats.get("root_values"))
+                .and_then(Value::as_array)
+                .and_then(|values| {
+                    actions
+                        .iter()
+                        .position(|item| value_to_i64(item) == Some(action))
+                        .and_then(|idx| values.get(idx))
+                })
+                .and_then(Value::as_f64)
+                .unwrap_or(-1.0)
+        });
+        if best.map(|(_, value)| raw > value).unwrap_or(true) {
+            best = Some((action, raw));
+        }
+    }
+    let (action, raw_value) = best?;
+    let value = clamp_f64((raw_value + 1.0) / 2.0, 0.0, 1.0);
+    Some(ActionRecommendation {
+        label: label_action_id(action),
+        action_id: Some(action),
+        value: Some(value),
+        confidence: 0.78,
+        method: "dinoboard-c-abi-root-action-value-v0".to_string(),
+        reasons: vec![
+            format!("root action {action}"),
+            format!("root value {raw_value:.3}"),
+            "values only; no automation".to_string(),
+        ],
+    })
+}
+
+fn recommend_action_from_snapshot(
+    snapshot: Option<&Value>,
+    cards: &[CardInput],
+) -> Option<ActionRecommendation> {
+    let snapshot = snapshot?;
+    let player = current_snapshot_player(snapshot)?;
+    let gems = value_i64_array(player.get("tokens"), 6);
+    let bonuses = value_i64_array(player.get("bonuses"), 5);
+    let mut best_buy: Option<(&CardInput, f64)> = None;
+    let mut best_target: Option<(&CardInput, f64, i64)> = None;
+    for card in cards {
+        let cost = card_cost_vector(card);
+        let (deficit, _) = payment_deficit(&cost, &bonuses, &gems);
+        let value = score_card_with_snapshot(card, snapshot).value;
+        if deficit == 0 && best_buy.map(|(_, score)| value > score).unwrap_or(true) {
+            best_buy = Some((card, value));
+        }
+        if deficit > 0
+            && best_target
+                .map(|(_, score, old_deficit)| {
+                    value - deficit as f64 * 0.04 > score - old_deficit as f64 * 0.04
+                })
+                .unwrap_or(true)
+        {
+            best_target = Some((card, value, deficit));
+        }
+    }
+    if let Some((card, value)) = best_buy {
+        return Some(ActionRecommendation {
+            label: format!("购买 {}", short_card_label(card)),
+            action_id: card.buy_action_id,
+            value: Some(value),
+            confidence: 0.72,
+            method: "state-aware-heuristic-v1".to_string(),
+            reasons: vec![
+                "card is affordable now".to_string(),
+                short_card_reason(card),
+                "values only; no automation".to_string(),
+            ],
+        });
+    }
+
+    let reserved_count = player
+        .get("reserved")
+        .and_then(Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    if let Some((card, value, deficit)) = best_target {
+        let bank = value_i64_array(snapshot.get("bank"), 6);
+        let take = suggested_gems_for_card(card, &bonuses, &gems, &bank);
+        if !take.is_empty() {
+            return Some(ActionRecommendation {
+                label: format!("拿宝石 {}", take.join(" ")),
+                action_id: None,
+                value: Some(clamp_f64(value - deficit as f64 * 0.03, 0.0, 1.0)),
+                confidence: 0.62,
+                method: "state-aware-heuristic-v1".to_string(),
+                reasons: vec![
+                    format!("toward {}", short_card_label(card)),
+                    format!("{deficit} tokens short"),
+                    "values only; no automation".to_string(),
+                ],
+            });
+        }
+        if reserved_count < 3 {
+            return Some(ActionRecommendation {
+                label: format!("预定 {}", short_card_label(card)),
+                action_id: card.reserve_action_id,
+                value: Some(clamp_f64(value * 0.92, 0.0, 1.0)),
+                confidence: 0.56,
+                method: "state-aware-heuristic-v1".to_string(),
+                reasons: vec![
+                    "no useful gem take found".to_string(),
+                    short_card_reason(card),
+                    "values only; no automation".to_string(),
+                ],
+            });
+        }
+    }
+    Some(ActionRecommendation {
+        label: "放弃或调整目标".to_string(),
+        action_id: None,
+        value: Some(0.2),
+        confidence: 0.35,
+        method: "state-aware-heuristic-v1".to_string(),
+        reasons: vec!["no clearly useful public action found".to_string()],
+    })
+}
+
+fn suggested_gems_for_card(
+    card: &CardInput,
+    bonuses: &[i64],
+    gems: &[i64],
+    bank: &[i64],
+) -> Vec<String> {
+    let cost = card_cost_vector(card);
+    let mut needed: Vec<(usize, i64)> = (0..COLORS.len())
+        .map(|idx| {
+            (
+                idx,
+                (cost.get(idx).copied().unwrap_or(0)
+                    - bonuses.get(idx).copied().unwrap_or(0)
+                    - gems.get(idx).copied().unwrap_or(0))
+                .max(0),
+            )
+        })
+        .filter(|(idx, need)| *need > 0 && bank.get(*idx).copied().unwrap_or(0) > 0)
+        .collect();
+    needed.sort_by(|a, b| b.1.cmp(&a.1));
+    if let Some((idx, need)) = needed.first().copied() {
+        if need >= 2 && bank.get(idx).copied().unwrap_or(0) >= 4 {
+            return vec![color_short(idx).to_string(), color_short(idx).to_string()];
+        }
+    }
+    needed
+        .into_iter()
+        .take(3)
+        .map(|(idx, _)| color_short(idx).to_string())
+        .collect()
+}
+
+fn color_short(idx: usize) -> &'static str {
+    match idx {
+        0 => "W",
+        1 => "U",
+        2 => "G",
+        3 => "R",
+        4 => "B",
+        _ => "?",
+    }
+}
+
+fn short_card_label(card: &CardInput) -> String {
+    format!(
+        "T{} {} {}P",
+        card.tier.unwrap_or(0),
+        card.bonus_color
+            .as_ref()
+            .and_then(|color| COLORS.iter().position(|known| known == color))
+            .map(color_short)
+            .unwrap_or("?"),
+        card.points.unwrap_or(0)
+    )
+}
+
+fn short_card_reason(card: &CardInput) -> String {
+    format!(
+        "{} cost {}",
+        short_card_label(card),
+        card_cost_vector(card).iter().sum::<i64>()
+    )
+}
+
+fn label_action_id(action: i64) -> String {
+    match action {
+        0..=11 => format!("购买 T{} 第{}张", action / 4 + 1, action % 4 + 1),
+        12..=23 => {
+            let slot = action - 12;
+            format!("预定 T{} 第{}张", slot / 4 + 1, slot % 4 + 1)
+        }
+        24..=26 => format!("预定 T{} 牌堆", action - 23),
+        27..=29 => format!("购买预定牌 {}", action - 26),
+        30..=39 => "拿三种宝石".to_string(),
+        40..=49 => "拿两种宝石".to_string(),
+        50..=54 => "拿一种宝石".to_string(),
+        55..=59 => "拿两个同色宝石".to_string(),
+        _ => "执行最高价值合法动作".to_string(),
+    }
+}
+
+unsafe fn apply_splendor_snapshot_to_dinoboard(
+    api: &DinoBoardApi,
+    session: *mut c_void,
+    snapshot: &Value,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    let schema = snapshot
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if schema != "gemhud-dinoboard-splendor-public-snapshot-v1" {
+        return Err(format!("unsupported snapshot schema: {schema}"));
+    }
+    let players = snapshot
+        .get("players")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "snapshot missing players".to_string())?;
+    let num_players = snapshot
+        .get("num_players")
+        .and_then(value_to_i64)
+        .unwrap_or(players.len() as i64)
+        .clamp(2, 4) as usize;
+    if players.len() < num_players {
+        return Err(format!(
+            "snapshot has {} player records but num_players is {num_players}",
+            players.len()
+        ));
+    }
+
+    let card_pool_json = owned_string((api.splendor_card_pool_json)(), api.string_free);
+    let card_pool: Vec<DinoCardDef> = serde_json::from_str(&card_pool_json)
+        .map_err(|err| format!("invalid DinoBoard card pool JSON: {err}"))?;
+    let nobles_json = owned_string((api.splendor_nobles_json)(), api.string_free);
+    let noble_defs: Vec<DinoNobleDef> = serde_json::from_str(&nobles_json)
+        .map_err(|err| format!("invalid DinoBoard nobles JSON: {err}"))?;
+    let mut used_cards = HashSet::new();
+
+    set_int_field(
+        api,
+        session,
+        "current_player",
+        &[],
+        snapshot
+            .get("current_player")
+            .and_then(value_to_i64)
+            .unwrap_or(0)
+            .clamp(0, num_players as i64 - 1),
+    )?;
+    set_int_field(
+        api,
+        session,
+        "first_player",
+        &[],
+        snapshot
+            .get("first_player")
+            .and_then(value_to_i64)
+            .unwrap_or(0)
+            .clamp(0, num_players as i64 - 1),
+    )?;
+    set_int_field(
+        api,
+        session,
+        "plies",
+        &[],
+        snapshot
+            .get("plies")
+            .and_then(value_to_i64)
+            .unwrap_or(0)
+            .max(0),
+    )?;
+    set_int_field(api, session, "final_round_remaining", &[], -1)?;
+    set_int_field(
+        api,
+        session,
+        "stage",
+        &[],
+        snapshot
+            .get("stage")
+            .and_then(value_to_i64)
+            .unwrap_or(0)
+            .clamp(0, 2),
+    )?;
+    set_int_field(
+        api,
+        session,
+        "pending_returns",
+        &[],
+        snapshot
+            .get("pending_returns")
+            .and_then(value_to_i64)
+            .unwrap_or(0)
+            .max(0),
+    )?;
+    set_int_field(api, session, "pending_nobles_size", &[], 0)?;
+    for slot in 0..(num_players + 1) {
+        set_int_field(api, session, "pending_noble_slots", &[slot], -1)?;
+    }
+    set_int_field(api, session, "winner", &[], -1)?;
+    set_int_field(api, session, "terminal", &[], 0)?;
+    set_int_field(api, session, "shared_victory", &[], 0)?;
+
+    let bank = value_i64_array(snapshot.get("bank"), 6);
+    for color in 0..6 {
+        set_int_field(api, session, "bank", &[color], bank[color])?;
+    }
+
+    let market = snapshot
+        .get("market")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "snapshot missing market".to_string())?;
+    for tier_idx in 0..3 {
+        let row = market
+            .get(tier_idx)
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let row_len = row.len().min(4);
+        set_int_field(api, session, "tableau_size", &[tier_idx], row_len as i64)?;
+        for slot in 0..4 {
+            let cid = if slot < row_len {
+                match_card_def(
+                    row.get(slot).unwrap(),
+                    Some(tier_idx),
+                    &card_pool,
+                    &mut used_cards,
+                )?
+            } else {
+                -1
+            };
+            set_int_field(api, session, "tableau", &[tier_idx, slot], cid)?;
+        }
+    }
+
+    let deck_sizes = value_i64_array(snapshot.get("deck_sizes"), 3);
+    for tier_idx in 0..3 {
+        set_int_field(
+            api,
+            session,
+            "deck_sizes",
+            &[tier_idx],
+            deck_sizes[tier_idx].max(0),
+        )?;
+    }
+
+    let empty_reserved = Vec::new();
+    for player_idx in 0..num_players {
+        let player = &players[player_idx];
+        let points = player
+            .get("points")
+            .and_then(value_to_i64)
+            .unwrap_or(0)
+            .max(0);
+        set_int_field(api, session, "scores", &[player_idx], 0)?;
+        set_int_field(api, session, "player_points", &[player_idx], points)?;
+        set_int_field(
+            api,
+            session,
+            "player_cards_count",
+            &[player_idx],
+            player
+                .get("cards_count")
+                .and_then(value_to_i64)
+                .unwrap_or(0)
+                .max(0),
+        )?;
+        set_int_field(
+            api,
+            session,
+            "player_nobles_count",
+            &[player_idx],
+            player
+                .get("nobles_count")
+                .and_then(value_to_i64)
+                .unwrap_or(0)
+                .max(0),
+        )?;
+
+        let tokens = value_i64_array(player.get("tokens"), 6);
+        for color in 0..6 {
+            set_int_field(
+                api,
+                session,
+                "player_gems",
+                &[player_idx, color],
+                tokens[color],
+            )?;
+        }
+        let bonuses = value_i64_array(player.get("bonuses"), 5);
+        for color in 0..5 {
+            set_int_field(
+                api,
+                session,
+                "player_bonuses",
+                &[player_idx, color],
+                bonuses[color],
+            )?;
+        }
+
+        let reserved = player
+            .get("reserved")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty_reserved);
+        let reserved_size = reserved.len().min(3);
+        set_int_field(
+            api,
+            session,
+            "reserved_size",
+            &[player_idx],
+            reserved_size as i64,
+        )?;
+        for slot in 0..3 {
+            let mut cid = -1;
+            let mut visible = false;
+            if slot < reserved_size {
+                let reserved_card = &reserved[slot];
+                visible = reserved_card
+                    .get("visible")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if snapshot_card_has_identity(reserved_card) {
+                    cid = match_card_def(reserved_card, None, &card_pool, &mut used_cards)?;
+                } else {
+                    warnings.push(format!(
+                        "reserved card p{} slot{} is hidden; DinoBoard keeps it unknown",
+                        player_idx + 1,
+                        slot + 1
+                    ));
+                }
+            }
+            set_int_field(api, session, "reserved", &[player_idx, slot], cid)?;
+            set_int_field(
+                api,
+                session,
+                "reserved_visible",
+                &[player_idx, slot],
+                if visible { 1 } else { 0 },
+            )?;
+            for viewer in 0..num_players {
+                let can_see = cid >= 0 && (visible || viewer == player_idx);
+                set_viz_field(
+                    api,
+                    session,
+                    "reserved",
+                    &[player_idx, slot],
+                    viewer,
+                    can_see,
+                )?;
+            }
+        }
+    }
+
+    let empty_nobles = Vec::new();
+    let nobles = snapshot
+        .get("nobles")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty_nobles);
+    let noble_count = nobles.len().min(num_players + 1);
+    set_int_field(api, session, "nobles_size", &[], noble_count as i64)?;
+    for slot in 0..(num_players + 1) {
+        let nid = if slot < noble_count {
+            match_noble_def(&nobles[slot], &noble_defs)?
+        } else {
+            -1
+        };
+        set_int_field(api, session, "nobles", &[slot], nid)?;
+    }
+
+    rebuild_views(api, session)?;
+    Ok(())
+}
+
+unsafe fn set_int_field(
+    api: &DinoBoardApi,
+    session: *mut c_void,
+    field: &str,
+    indices: &[usize],
+    value: i64,
+) -> Result<(), String> {
+    let field_c =
+        CString::new(field).map_err(|_| format!("field name contains NUL byte: {field}"))?;
+    let indices_c: Vec<c_int> = indices.iter().map(|idx| *idx as c_int).collect();
+    let mut err: *mut c_char = ptr::null_mut();
+    let ok = (api.session_set_int_field)(
+        session,
+        field_c.as_ptr(),
+        if indices_c.is_empty() {
+            ptr::null()
+        } else {
+            indices_c.as_ptr()
+        },
+        indices_c.len() as c_int,
+        value as c_int,
+        &mut err,
+    );
+    if ok == 0 {
+        Err(take_error(err, api.string_free))
+    } else {
+        Ok(())
+    }
+}
+
+unsafe fn set_viz_field(
+    api: &DinoBoardApi,
+    session: *mut c_void,
+    field: &str,
+    indices: &[usize],
+    viewer: usize,
+    visible: bool,
+) -> Result<(), String> {
+    let field_c =
+        CString::new(field).map_err(|_| format!("field name contains NUL byte: {field}"))?;
+    let indices_c: Vec<c_int> = indices.iter().map(|idx| *idx as c_int).collect();
+    let mut err: *mut c_char = ptr::null_mut();
+    let ok = (api.session_set_viz_field)(
+        session,
+        field_c.as_ptr(),
+        if indices_c.is_empty() {
+            ptr::null()
+        } else {
+            indices_c.as_ptr()
+        },
+        indices_c.len() as c_int,
+        viewer as c_int,
+        if visible { 1 } else { 0 },
+        &mut err,
+    );
+    if ok == 0 {
+        Err(take_error(err, api.string_free))
+    } else {
+        Ok(())
+    }
+}
+
+unsafe fn rebuild_views(api: &DinoBoardApi, session: *mut c_void) -> Result<(), String> {
+    let mut err: *mut c_char = ptr::null_mut();
+    let ok = (api.session_rebuild_views)(session, &mut err);
+    if ok == 0 {
+        Err(take_error(err, api.string_free))
+    } else {
+        Ok(())
+    }
+}
+
+fn match_card_def(
+    card: &Value,
+    tier_index: Option<usize>,
+    card_pool: &[DinoCardDef],
+    used_cards: &mut HashSet<i64>,
+) -> Result<i64, String> {
+    let tier = snapshot_card_tier(card, tier_index)?;
+    let points = card
+        .get("points")
+        .and_then(value_to_i64)
+        .unwrap_or(0)
+        .max(0);
+    let color = card
+        .get("bonus_color")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "snapshot card missing bonus_color".to_string())?;
+    let bonus = bonus_index(color).ok_or_else(|| {
+        format!("snapshot card uses non-base bonus color '{color}', cannot map to DinoBoard")
+    })?;
+    let cost = value_i64_array(card.get("cost"), 5);
+
+    let mut fallback_used = None;
+    for def in card_pool {
+        if def.tier == tier && def.bonus == bonus && def.points == points && def.cost == cost {
+            if !used_cards.contains(&def.id) {
+                used_cards.insert(def.id);
+                return Ok(def.id);
+            }
+            fallback_used = Some(def.id);
+        }
+    }
+    if let Some(id) = fallback_used {
+        return Ok(id);
+    }
+    Err(format!(
+        "could not map snapshot card tier={tier} bonus={bonus} points={points} cost={cost:?}"
+    ))
+}
+
+fn match_noble_def(noble: &Value, noble_defs: &[DinoNobleDef]) -> Result<i64, String> {
+    let requirements = value_i64_array(noble.get("requirements"), 5);
+    noble_defs
+        .iter()
+        .find(|def| def.requirements == requirements)
+        .map(|def| def.id)
+        .ok_or_else(|| format!("could not map noble requirements={requirements:?}"))
+}
+
+fn snapshot_card_tier(card: &Value, tier_index: Option<usize>) -> Result<i64, String> {
+    if let Some(tier_index) = tier_index {
+        return Ok(tier_index as i64 + 1);
+    }
+    let raw = card
+        .get("tier")
+        .and_then(value_to_i64)
+        .ok_or_else(|| "snapshot card missing tier".to_string())?;
+    if (1..=3).contains(&raw) {
+        Ok(raw)
+    } else if (0..=2).contains(&raw) {
+        Ok(raw + 1)
+    } else {
+        Err(format!("snapshot card has invalid tier {raw}"))
+    }
+}
+
+fn snapshot_card_has_identity(card: &Value) -> bool {
+    card.get("bonus_color").and_then(Value::as_str).is_some()
+        && card.get("cost").and_then(Value::as_array).is_some()
+        && card.get("tier").and_then(value_to_i64).is_some()
+}
+
+fn bonus_index(color: &str) -> Option<i64> {
+    match color.trim().to_ascii_lowercase().as_str() {
+        "white" => Some(0),
+        "blue" => Some(1),
+        "green" => Some(2),
+        "red" => Some(3),
+        "black" => Some(4),
+        _ => None,
+    }
+}
+
+fn append_snapshot_warnings(snapshot: &Value, warnings: &mut Vec<String>) {
+    if snapshot
+        .get("supported")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+        == false
+    {
+        warnings.push(
+            "Mapped BGA state is not base-Splendor-only; expansion rules are outside the current DinoBoard base model."
+                .to_string(),
+        );
+    }
+    if let Some(items) = snapshot.get("warnings").and_then(Value::as_array) {
+        for item in items.iter().filter_map(Value::as_str).take(4) {
+            warnings.push(format!("BGA snapshot: {item}"));
+        }
+    }
+}
+
+fn score_card_with_snapshot(card: &CardInput, snapshot: &Value) -> CardValue {
+    let mut scored = score_card(card);
+    let Some(player) = current_snapshot_player(snapshot) else {
+        scored
+            .reasons
+            .push("snapshot missing active player".to_string());
+        return scored;
+    };
+
+    let gems = value_i64_array(player.get("tokens"), 6);
+    let bonuses = value_i64_array(player.get("bonuses"), 5);
+    let cost = card_cost_vector(card);
+    let (deficit, gold_used) = payment_deficit(&cost, &bonuses, &gems);
+
+    scored.method = "bga-state-aware-heuristic-v1".to_string();
+    scored.confidence = scored.confidence.max(0.9);
+    if deficit == 0 {
+        scored.value += 0.16;
+        if gold_used > 0 {
+            scored
+                .reasons
+                .push(format!("buyable now using {gold_used} gold"));
+        } else {
+            scored.reasons.push("buyable now".to_string());
+        }
+    } else if deficit <= 2 {
+        scored.value += 0.06;
+        scored.reasons.push(format!("{deficit} token short"));
+    } else {
+        let penalty = (deficit as f64 * 0.035).min(0.18);
+        scored.value -= penalty;
+        scored.reasons.push(format!("{deficit} tokens short"));
+    }
+
+    if opponent_can_buy(card, snapshot) {
+        scored.value += 0.04;
+        scored.reasons.push("opponent can buy".to_string());
+    }
+    if advances_visible_noble(card, snapshot, &bonuses) {
+        scored.value += 0.05;
+        scored.reasons.push("helps visible noble".to_string());
+    }
+
+    scored.value = clamp_f64(scored.value, 0.0, 1.0);
+    scored.label = value_label(scored.value).to_string();
+    scored.reasons.truncate(6);
+    scored
+}
+
+fn current_snapshot_player(snapshot: &Value) -> Option<&Value> {
+    let current = snapshot
+        .get("current_player")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0) as usize;
+    snapshot
+        .get("players")
+        .and_then(Value::as_array)
+        .and_then(|players| players.get(current))
+}
+
+fn value_i64_array(value: Option<&Value>, len: usize) -> Vec<i64> {
+    let mut out = vec![0; len];
+    if let Some(items) = value.and_then(Value::as_array) {
+        for (idx, item) in items.iter().take(len).enumerate() {
+            out[idx] = value_to_i64(item).unwrap_or(0).max(0);
+        }
+    }
+    out
+}
+
+fn card_cost_vector(card: &CardInput) -> Vec<i64> {
+    COLORS
+        .iter()
+        .map(|color| {
+            card.cost
+                .get(*color)
+                .and_then(value_to_i64)
+                .unwrap_or(0)
+                .max(0)
+        })
+        .collect()
+}
+
+fn payment_deficit(cost: &[i64], bonuses: &[i64], gems: &[i64]) -> (i64, i64) {
+    let mut deficit = 0;
+    let mut gold_left = gems.get(5).copied().unwrap_or(0).max(0);
+    let mut gold_used = 0;
+    for color in 0..COLORS.len() {
+        let need = (cost.get(color).copied().unwrap_or(0)
+            - bonuses.get(color).copied().unwrap_or(0))
+        .max(0);
+        let short = (need - gems.get(color).copied().unwrap_or(0)).max(0);
+        let covered = short.min(gold_left);
+        gold_left -= covered;
+        gold_used += covered;
+        deficit += short - covered;
+    }
+    (deficit, gold_used)
+}
+
+fn opponent_can_buy(card: &CardInput, snapshot: &Value) -> bool {
+    let current = snapshot
+        .get("current_player")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let cost = card_cost_vector(card);
+    snapshot
+        .get("players")
+        .and_then(Value::as_array)
+        .map(|players| {
+            players.iter().enumerate().any(|(idx, player)| {
+                idx as i64 != current && {
+                    let gems = value_i64_array(player.get("tokens"), 6);
+                    let bonuses = value_i64_array(player.get("bonuses"), 5);
+                    payment_deficit(&cost, &bonuses, &gems).0 == 0
+                }
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn advances_visible_noble(card: &CardInput, snapshot: &Value, bonuses: &[i64]) -> bool {
+    let Some(color) = card
+        .bonus_color
+        .as_ref()
+        .and_then(|color| COLORS.iter().position(|known| known == color))
+    else {
+        return false;
+    };
+    snapshot
+        .get("nobles")
+        .and_then(Value::as_array)
+        .map(|nobles| {
+            nobles.iter().any(|noble| {
+                let req = value_i64_array(noble.get("requirements"), 5);
+                if req.get(color).copied().unwrap_or(0) <= bonuses.get(color).copied().unwrap_or(0)
+                {
+                    return false;
+                }
+                let missing_before: i64 = req
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, needed)| (needed - bonuses.get(idx).copied().unwrap_or(0)).max(0))
+                    .sum();
+                missing_before <= 5
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn score_card(card: &CardInput) -> CardValue {
@@ -716,7 +1645,12 @@ unsafe fn load_dinoboard_api(path: &PathBuf) -> Result<DinoBoardApi, String> {
             available_games_json: load_symbol(module, "dinoboard_available_games_json")?,
             session_create: load_symbol(module, "dinoboard_session_create")?,
             session_destroy: load_symbol(module, "dinoboard_session_destroy")?,
+            session_set_int_field: load_symbol(module, "dinoboard_session_set_int_field")?,
+            session_set_viz_field: load_symbol(module, "dinoboard_session_set_viz_field")?,
+            session_rebuild_views: load_symbol(module, "dinoboard_session_rebuild_views")?,
             session_decide_json: load_symbol(module, "dinoboard_session_decide_json")?,
+            splendor_card_pool_json: load_symbol(module, "dinoboard_splendor_card_pool_json")?,
+            splendor_nobles_json: load_symbol(module, "dinoboard_splendor_nobles_json")?,
         })
     }
 }

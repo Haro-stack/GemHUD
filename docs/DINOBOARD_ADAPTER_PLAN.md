@@ -1,22 +1,23 @@
 # DinoBoard Adapter Plan
 
-GemHUD v0 ships the browser bridge and a local value API. To use true DinoBoard
-MCTS values for BGA base Splendor, the next adapter needs these pieces.
+GemHUD v0 ships the browser bridge and a local value API. The Rust native
+adapter can now apply a BGA base Splendor public snapshot through DinoBoard's C
+ABI before running MCTS.
 
 ## Inputs From BGA
 
-The userscript already sends:
+The userscript sends:
 
 - visible card DOM summaries
-- sanitized public `gamedatas` context when available
+- a mapped `dinoboard_snapshot` from public `gameui.gamedatas` when available
 - source URL and client card IDs
 
-The adapter must validate the exact BGA base Splendor field names before using
-them for model-backed analysis.
+The adapter keeps the raw BGA payload out of the scoring core. Rust receives the
+normalized snapshot and writes the fields into DinoBoard's schema slots.
 
 ## DinoBoard Mapping
 
-The adapter should build a DinoBoard-compatible base Splendor public snapshot:
+The mapper builds a DinoBoard-compatible base Splendor public snapshot:
 
 - bank tokens
 - player gems, bonuses, points, card counts, and reserve counts
@@ -25,8 +26,8 @@ The adapter should build a DinoBoard-compatible base Splendor public snapshot:
 - deck sizes
 - current player and pending stage
 
-Then it can run DinoBoard analysis with root edge coverage and map root action
-values back to visible cards:
+Then native mode runs DinoBoard analysis with root edge coverage and maps root
+action values back to visible cards:
 
 - `buy_faceup` action value -> card buy value
 - `reserve_faceup` action value -> card reserve value
@@ -52,5 +53,6 @@ the policy/value network. The Rust adapter still needs DinoBoard's rules,
 feature encoder, legal action generator, observation tracker, and MCTS to
 produce correct card action values.
 
-Current native mode maps card slot action ids to DinoBoard root action values.
-Exact live BGA table values still require the snapshot mapper described above.
+Current native mode maps BGA base-card features to DinoBoard internal card ids,
+applies the snapshot through low-level C ABI field setters, rebuilds masked AI
+views, and maps card slot action ids to DinoBoard root action values.
