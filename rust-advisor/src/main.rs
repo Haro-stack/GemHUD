@@ -11,7 +11,7 @@ use std::ptr;
 use std::thread;
 use std::time::Instant;
 
-const VERSION: &str = "0.1.0";
+const VERSION: &str = "0.1.1";
 const DEFAULT_ADDR: &str = "127.0.0.1:8787";
 const DEFAULT_SIMULATIONS: i32 = 256;
 const DEFAULT_SEED: u64 = 20260524;
