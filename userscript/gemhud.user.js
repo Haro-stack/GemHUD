@@ -147,6 +147,7 @@
   let lastRunAt = 0;
   let pendingTimer = 0;
   let scanSeq = 0;
+  let scanInFlight = false;
   let lastCardElements = new Map();
   let lastCardMeta = new Map();
 
@@ -1324,9 +1325,9 @@
       setStatus("Waiting for Splendor page");
       return;
     }
-    const seq = ++scanSeq;
     const now = Date.now();
     if (now - lastRunAt < 2000 && reason !== "manual") return;
+    if (scanInFlight && reason !== "manual") return;
     lastRunAt = now;
 
     const payload = buildPayload();
@@ -1335,6 +1336,8 @@
       return;
     }
 
+    const seq = ++scanSeq;
+    scanInFlight = true;
     setStatus(`Sending ${payload.dom_card_count} cards, ${payload.carddb_card_count || 0} from carddb, snapshot ${payload.dinoboard_snapshot ? "mapped" : "missing"}`);
     try {
       const response = await postJson(endpoint(), payload);
@@ -1345,6 +1348,8 @@
       setStatus(`Rendered ${count} values (${mode})`);
     } catch (err) {
       setStatus(`Advisor offline: ${err.message}`);
+    } finally {
+      if (seq === scanSeq) scanInFlight = false;
     }
   }
 
