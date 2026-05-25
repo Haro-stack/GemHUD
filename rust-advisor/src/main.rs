@@ -9,6 +9,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::thread;
+use std::time::Instant;
 
 const VERSION: &str = "0.1.0";
 const DEFAULT_ADDR: &str = "127.0.0.1:8787";
@@ -249,6 +250,20 @@ fn main() {
             EngineMode::Heuristic => "public-card heuristic",
             EngineMode::DinoBoardNative => "DinoBoard C ABI native adapter",
         }
+    );
+    println!(
+        "Config: simulations={}, model={}, dinoboard_dll={}",
+        config.simulations,
+        config
+            .model_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        config
+            .dinoboard_dll
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string())
     );
 
     for stream in listener.incoming() {
@@ -499,7 +514,16 @@ fn print_usage() {
 
 fn handle_connection(mut stream: TcpStream, config: &Config) -> Result<(), String> {
     let request = read_http_request(&mut stream)?;
+    let method = request.method.clone();
+    let path = request.path.clone();
+    let body_len = request.body.len();
+    let started = Instant::now();
+    println!("{method} {path} body={body_len} bytes");
     let response = route(request, config);
+    println!(
+        "{method} {path} done in {}ms",
+        started.elapsed().as_millis()
+    );
     stream
         .write_all(response.as_bytes())
         .map_err(|err| format!("write failed: {err}"))?;
@@ -612,6 +636,7 @@ fn analyze_route(body: &[u8], config: &Config) -> String {
             )
         }
     };
+    let analyze_started = Instant::now();
 
     let game = req.game.trim().to_ascii_lowercase();
     if !matches!(
@@ -647,6 +672,13 @@ fn analyze_route(body: &[u8], config: &Config) -> String {
     if let Some(snapshot) = &req.dinoboard_snapshot {
         append_snapshot_warnings(snapshot, &mut warnings);
     }
+    println!(
+        "Analyze start: cards={}, snapshot={}, engine={}, simulations={}",
+        req.cards.len(),
+        req.dinoboard_snapshot.is_some(),
+        engine_name(config.engine),
+        config.simulations
+    );
     let (cards, recommendation) = if config.engine == EngineMode::DinoBoardNative {
         match score_cards_with_dinoboard(
             &req.cards,
@@ -689,6 +721,17 @@ fn analyze_route(body: &[u8], config: &Config) -> String {
             recommend_action_from_snapshot(req.dinoboard_snapshot.as_ref(), &req.cards),
         )
     };
+    let recommendation_label = recommendation
+        .as_ref()
+        .map(|item| item.label.as_str())
+        .unwrap_or("-");
+    println!(
+        "Analyze result: cards={}, recommendation={}, warnings={}, elapsed={}ms",
+        cards.len(),
+        recommendation_label,
+        warnings.len(),
+        analyze_started.elapsed().as_millis()
+    );
     let response = AnalyzeResponse {
         ok: true,
         engine: if config.engine == EngineMode::DinoBoardNative {
@@ -719,16 +762,17 @@ fn score_cards_with_dinoboard(
         .dinoboard_dll
         .as_ref()
         .ok_or_else(|| "--dinoboard-dll is required".to_string())?;
-    let model = config
+    let configured_model = config
         .model_path
         .as_ref()
         .ok_or_else(|| "--model is required".to_string())?;
-    let api = unsafe { load_dinoboard_api(dll)? };
-    let model_c = CString::new(model.to_string_lossy().as_bytes())
-        .map_err(|_| "model path contains NUL byte".to_string())?;
     let game_id = snapshot
         .and_then(|value| value.get("game_id").and_then(Value::as_str))
         .unwrap_or("splendor_2p");
+    let model = model_path_for_game(configured_model, game_id);
+    let api = unsafe { load_dinoboard_api(dll)? };
+    let model_c = CString::new(model.to_string_lossy().as_bytes())
+        .map_err(|_| "model path contains NUL byte".to_string())?;
     let game_c = CString::new(game_id).map_err(|_| "game_id contains NUL byte".to_string())?;
     unsafe {
         let mut err: *mut c_char = ptr::null_mut();
@@ -784,6 +828,20 @@ fn score_cards_with_dinoboard(
             recommendation: recommend_action_from_root(&parsed),
         })
     }
+}
+
+fn model_path_for_game(configured_model: &Path, game_id: &str) -> PathBuf {
+    let filename = match game_id {
+        "splendor_2p" => "splendor_2p.onnx",
+        "splendor_3p" => "splendor_3p.onnx",
+        "splendor_4p" => "splendor_4p.onnx",
+        _ => return configured_model.to_path_buf(),
+    };
+    configured_model
+        .parent()
+        .map(|parent| parent.join(filename))
+        .filter(|candidate| candidate.exists())
+        .unwrap_or_else(|| configured_model.to_path_buf())
 }
 
 fn score_card_with_dinoboard(card: &CardInput, root: &Value) -> CardValue {

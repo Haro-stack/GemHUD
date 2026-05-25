@@ -1216,6 +1216,16 @@
   function postJson(url, payload) {
     return new Promise((resolve, reject) => {
       const body = JSON.stringify(payload);
+      let settled = false;
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        fn(value);
+      };
+      const timer = window.setTimeout(() => {
+        finish(reject, new Error("Advisor request timed out"));
+      }, 12000);
       if (typeof GM_xmlhttpRequest === "function") {
         GM_xmlhttpRequest({
           method: "POST",
@@ -1225,13 +1235,14 @@
           timeout: 10000,
           onload: (res) => {
             try {
-              resolve(JSON.parse(res.responseText || "{}"));
+              finish(resolve, JSON.parse(res.responseText || "{}"));
             } catch (err) {
-              reject(new Error(`Advisor returned invalid JSON: ${err.message}`));
+              finish(reject, new Error(`Advisor returned invalid JSON: ${err.message}`));
             }
           },
-          onerror: () => reject(new Error("Advisor request failed")),
-          ontimeout: () => reject(new Error("Advisor request timed out")),
+          onerror: () => finish(reject, new Error("Advisor request failed")),
+          onabort: () => finish(reject, new Error("Advisor request aborted")),
+          ontimeout: () => finish(reject, new Error("Advisor request timed out")),
         });
         return;
       }
@@ -1239,7 +1250,7 @@
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body,
-      }).then((r) => r.json()).then(resolve, reject);
+      }).then((r) => r.json()).then((value) => finish(resolve, value), (err) => finish(reject, err));
     });
   }
 
