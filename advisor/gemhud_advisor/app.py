@@ -393,16 +393,18 @@ def purchase_status_for_player(
     )
 
 
-def min_turns_to_cover_deficits(deficits: list[int], bank: list[int]) -> int:
+def min_turns_to_cover_deficits(deficits: list[int], _bank: list[int]) -> int:
     total = sum(deficits)
     if total <= 0:
         return 0
+    # Conservative display estimate: one action can cover up to three different
+    # colors, but do not assume repeated two-of-a-kind takes for one color.
+    # Future same-color refills depend on other players and are not guaranteed.
     turns = (total + 2) // 3
-    for idx, deficit in enumerate(deficits):
+    for deficit in deficits:
         if deficit <= 0:
             continue
-        per_color = (deficit + 1) // 2 if idx < len(bank) and bank[idx] >= 4 else deficit
-        turns = max(turns, per_color)
+        turns = max(turns, deficit)
     return max(1, turns)
 
 

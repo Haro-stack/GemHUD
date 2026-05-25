@@ -1931,22 +1931,18 @@ fn purchase_status_for_player(
     }
 }
 
-fn min_turns_to_cover_deficits(deficits: &[i64], bank: &[i64]) -> i64 {
+fn min_turns_to_cover_deficits(deficits: &[i64], _bank: &[i64]) -> i64 {
     let total: i64 = deficits.iter().sum();
     if total <= 0 {
         return 0;
     }
+    // Conservative display estimate: one action can cover up to three different
+    // colors, but we do not assume repeated two-of-a-kind takes for one color.
+    // After one same-color take the bank usually drops below four, and future
+    // refills depend on other players.
     let mut turns = (total + 2) / 3;
-    for (idx, deficit) in deficits.iter().copied().enumerate() {
-        if deficit <= 0 {
-            continue;
-        }
-        let per_color = if bank.get(idx).copied().unwrap_or(0) >= 4 {
-            (deficit + 1) / 2
-        } else {
-            deficit
-        };
-        turns = turns.max(per_color);
+    for deficit in deficits.iter().copied().filter(|deficit| *deficit > 0) {
+        turns = turns.max(deficit);
     }
     turns.max(1)
 }
@@ -2266,4 +2262,37 @@ fn json_response(status: u16, body: Value) -> String {
         body.len(),
         body
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_color_deficit_counts_one_per_turn() {
+        assert_eq!(
+            min_turns_to_cover_deficits(&[7, 0, 0, 0, 0], &[4, 4, 4, 4, 4, 5]),
+            7
+        );
+        assert_eq!(
+            min_turns_to_cover_deficits(&[2, 0, 0, 0, 0], &[4, 4, 4, 4, 4, 5]),
+            2
+        );
+    }
+
+    #[test]
+    fn mixed_color_deficit_allows_three_colors_per_turn() {
+        assert_eq!(
+            min_turns_to_cover_deficits(&[1, 1, 1, 0, 0], &[4, 4, 4, 4, 4, 5]),
+            1
+        );
+        assert_eq!(
+            min_turns_to_cover_deficits(&[2, 2, 2, 0, 0], &[4, 4, 4, 4, 4, 5]),
+            2
+        );
+        assert_eq!(
+            min_turns_to_cover_deficits(&[3, 3, 0, 0, 0], &[4, 4, 4, 4, 4, 5]),
+            3
+        );
+    }
 }
