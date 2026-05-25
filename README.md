@@ -58,7 +58,7 @@ If you do not want to start Python, GemHUD also includes a native Rust advisor:
 ```bash
 cd rust-advisor
 cargo build --release
-target\release\gemhud-advisor.exe --addr 127.0.0.1:8787
+target\release\gemhud-advisor.exe
 ```
 
 The Rust executable serves the same local values-only API:
@@ -68,16 +68,34 @@ GET  /health
 POST /analyze
 ```
 
-Current Rust mode defaults to `heuristic`, matching the first public-card value
-service. If you have built DinoBoard's native C ABI, `dinoboard-native` can load
-the DLL and use DinoBoard MCTS root action values:
+With no arguments, the Rust executable listens on `127.0.0.1:8787` and
+auto-detects a local DinoBoard checkout at `D:\codex\Haro-DinoBoard`. If the
+DinoBoard C ABI DLL and Splendor ONNX model are present, it starts
+`dinoboard-native`; otherwise it falls back to the lightweight public-card
+heuristic.
+
+You can still override any value with CLI flags:
 
 ```bash
 target\release\gemhud-advisor.exe \
   --engine dinoboard-native \
   --dinoboard-dll D:\codex\Haro-DinoBoard\build-capi\dinoboard_c_api.dll \
   --model D:\codex\Haro-DinoBoard\games\splendor\model\splendor_2p.onnx \
-  --simulations 96
+  --simulations 256
+```
+
+For a packaged local setup, place `gemhud-advisor.config.json` next to the
+executable or run it from a directory containing that file:
+
+```json
+{
+  "addr": "127.0.0.1:8787",
+  "engine": "dinoboard-native",
+  "dinoboard_dll": "D:\\codex\\Haro-DinoBoard\\build-capi\\dinoboard_c_api.dll",
+  "model": "D:\\codex\\Haro-DinoBoard\\games\\splendor\\model\\splendor_2p.onnx",
+  "simulations": 256,
+  "seed": 20260524
+}
 ```
 
 When the userscript can read BGA `gameui.gamedatas` or HullQin ccbs DOM state,

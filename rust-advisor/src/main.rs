@@ -3,14 +3,18 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::thread;
 
 const VERSION: &str = "0.1.0";
 const DEFAULT_ADDR: &str = "127.0.0.1:8787";
+const DEFAULT_SIMULATIONS: i32 = 256;
+const DEFAULT_SEED: u64 = 20260524;
+const CONFIG_FILE_NAME: &str = "gemhud-advisor.config.json";
 const COLORS: [&str; 5] = ["white", "blue", "green", "red", "black"];
 
 #[cfg(windows)]
@@ -35,6 +39,24 @@ struct Config {
 enum EngineMode {
     Heuristic,
     DinoBoardNative,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileConfig {
+    #[serde(default)]
+    addr: Option<String>,
+    #[serde(default)]
+    engine: Option<String>,
+    #[serde(default)]
+    model: Option<PathBuf>,
+    #[serde(default)]
+    model_path: Option<PathBuf>,
+    #[serde(default)]
+    dinoboard_dll: Option<PathBuf>,
+    #[serde(default)]
+    simulations: Option<i32>,
+    #[serde(default)]
+    seed: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,15 +267,63 @@ fn main() {
 }
 
 fn parse_config(args: Vec<String>) -> Result<Config, String> {
+    let mut config_path = None;
+    let mut arg_index = 0;
+    while arg_index < args.len() {
+        if args[arg_index] == "--config" {
+            arg_index += 1;
+            config_path = Some(PathBuf::from(
+                args.get(arg_index)
+                    .ok_or_else(|| "--config requires a value".to_string())?,
+            ));
+        }
+        arg_index += 1;
+    }
+
     let mut addr = DEFAULT_ADDR.to_string();
     let mut engine = EngineMode::Heuristic;
+    let mut engine_explicit = false;
     let mut model_path = None;
     let mut dinoboard_dll = None;
-    let mut simulations = 96_i32;
-    let mut seed = 20260524_u64;
+    let mut simulations = DEFAULT_SIMULATIONS;
+    let mut seed = DEFAULT_SEED;
+
+    if let Some(file_config) = load_file_config(config_path.as_deref())? {
+        if let Some(value) = file_config.addr {
+            addr = value;
+        }
+        if let Some(raw) = file_config.engine {
+            engine = parse_engine(&raw)?;
+            engine_explicit = true;
+        }
+        model_path = file_config.model_path.or(file_config.model).or(model_path);
+        dinoboard_dll = file_config.dinoboard_dll.or(dinoboard_dll);
+        if let Some(value) = file_config.simulations {
+            simulations = validate_simulations(value)?;
+        }
+        if let Some(value) = file_config.seed {
+            seed = value;
+        }
+    }
+
+    if dinoboard_dll.is_none() {
+        dinoboard_dll = auto_detect_dinoboard_dll();
+    }
+    if model_path.is_none() {
+        model_path = auto_detect_dinoboard_model();
+    }
+    if !engine_explicit && dinoboard_dll.is_some() && model_path.is_some() {
+        engine = EngineMode::DinoBoardNative;
+    }
+
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--config" => {
+                i += 1;
+                args.get(i)
+                    .ok_or_else(|| "--config requires a value".to_string())?;
+            }
             "--addr" => {
                 i += 1;
                 addr = args
@@ -266,11 +336,7 @@ fn parse_config(args: Vec<String>) -> Result<Config, String> {
                 let raw = args
                     .get(i)
                     .ok_or_else(|| "--engine requires a value".to_string())?;
-                engine = match raw.as_str() {
-                    "heuristic" => EngineMode::Heuristic,
-                    "dinoboard-native" => EngineMode::DinoBoardNative,
-                    _ => return Err(format!("unsupported engine: {raw}")),
-                };
+                engine = parse_engine(raw)?;
             }
             "--model" => {
                 i += 1;
@@ -288,14 +354,12 @@ fn parse_config(args: Vec<String>) -> Result<Config, String> {
             }
             "--simulations" => {
                 i += 1;
-                simulations = args
-                    .get(i)
-                    .ok_or_else(|| "--simulations requires a value".to_string())?
-                    .parse::<i32>()
-                    .map_err(|err| format!("invalid --simulations value: {err}"))?;
-                if simulations <= 0 {
-                    return Err("--simulations must be positive".to_string());
-                }
+                simulations = validate_simulations(
+                    args.get(i)
+                        .ok_or_else(|| "--simulations requires a value".to_string())?
+                        .parse::<i32>()
+                        .map_err(|err| format!("invalid --simulations value: {err}"))?,
+                )?;
             }
             "--seed" => {
                 i += 1;
@@ -323,13 +387,113 @@ fn parse_config(args: Vec<String>) -> Result<Config, String> {
     })
 }
 
+fn parse_engine(raw: &str) -> Result<EngineMode, String> {
+    match raw {
+        "heuristic" => Ok(EngineMode::Heuristic),
+        "dinoboard-native" => Ok(EngineMode::DinoBoardNative),
+        _ => Err(format!("unsupported engine: {raw}")),
+    }
+}
+
+fn validate_simulations(value: i32) -> Result<i32, String> {
+    if value <= 0 {
+        return Err("--simulations must be positive".to_string());
+    }
+    Ok(value)
+}
+
+fn load_file_config(explicit_path: Option<&Path>) -> Result<Option<FileConfig>, String> {
+    let path = explicit_path.map(PathBuf::from).or_else(|| {
+        default_config_paths()
+            .into_iter()
+            .find(|path| path.exists())
+    });
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let text = fs::read_to_string(&path)
+        .map_err(|err| format!("failed to read config {}: {err}", path.display()))?;
+    let config = serde_json::from_str::<FileConfig>(&text)
+        .map_err(|err| format!("invalid config {}: {err}", path.display()))?;
+    Ok(Some(config))
+}
+
+fn default_config_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(current) = env::current_dir() {
+        paths.push(current.join(CONFIG_FILE_NAME));
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            paths.push(dir.join(CONFIG_FILE_NAME));
+            for ancestor in dir.ancestors().take(5) {
+                paths.push(ancestor.join(CONFIG_FILE_NAME));
+            }
+        }
+    }
+    dedupe_paths(paths)
+}
+
+fn auto_detect_dinoboard_dll() -> Option<PathBuf> {
+    dinoboard_root_candidates()
+        .into_iter()
+        .map(|root| root.join("build-capi").join("dinoboard_c_api.dll"))
+        .find(|path| path.exists())
+}
+
+fn auto_detect_dinoboard_model() -> Option<PathBuf> {
+    dinoboard_root_candidates()
+        .into_iter()
+        .map(|root| {
+            root.join("games")
+                .join("splendor")
+                .join("model")
+                .join("splendor_2p.onnx")
+        })
+        .find(|path| path.exists())
+}
+
+fn dinoboard_root_candidates() -> Vec<PathBuf> {
+    let mut paths = vec![PathBuf::from(r"D:\codex\Haro-DinoBoard")];
+    if let Ok(current) = env::current_dir() {
+        add_dinoboard_siblings(&mut paths, &current);
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            add_dinoboard_siblings(&mut paths, dir);
+        }
+    }
+    dedupe_paths(paths)
+}
+
+fn add_dinoboard_siblings(paths: &mut Vec<PathBuf>, start: &Path) {
+    for ancestor in start.ancestors().take(8) {
+        paths.push(ancestor.join("Haro-DinoBoard"));
+        if let Some(parent) = ancestor.parent() {
+            paths.push(parent.join("Haro-DinoBoard"));
+        }
+    }
+}
+
+fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for path in paths {
+        let key = path.to_string_lossy().to_string();
+        if seen.insert(key) {
+            out.push(path);
+        }
+    }
+    out
+}
+
 fn print_usage() {
     eprintln!(
-        "Usage: gemhud-advisor [--addr 127.0.0.1:8787] [--engine heuristic|dinoboard-native] [--model path] [--dinoboard-dll path]\n\
+        "Usage: gemhud-advisor [--config path] [--addr 127.0.0.1:8787] [--engine heuristic|dinoboard-native] [--model path] [--dinoboard-dll path] [--simulations 256]\n\
          \n\
          The current executable serves GemHUD's values-only /analyze API.\n\
-         dinoboard-native loads DinoBoard's C ABI DLL and uses ONNX/MCTS root values.\n\
-         It still needs a BGA snapshot mapper for fully accurate live-position values."
+         With no arguments, it auto-detects a local Haro-DinoBoard DLL/model when available.\n\
+         Optional config file: gemhud-advisor.config.json next to the executable or current directory."
     );
 }
 
