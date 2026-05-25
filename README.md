@@ -1,12 +1,12 @@
 # GemHUD
 
-GemHUD is a practice overlay for **Board Game Arena base Splendor**. It reads
-public card information from the BGA frontend, sends it to a local-only advisor,
-and displays value badges beside visible cards.
+GemHUD is a practice overlay for **base Splendor** on Board Game Arena and the
+HullQin ccbs page. It reads public card information from the frontend, sends it
+to a local-only advisor, and displays value badges beside visible cards.
 
 GemHUD is intentionally values-only:
 
-- It does not click, submit, or automate BGA actions.
+- It does not click, submit, or automate game actions.
 - It does not read hidden decks or private server data.
 - It does not send BGA credentials to the local advisor.
 - It currently supports **base Splendor only**. Orient, Strongholds, Cities,
@@ -40,7 +40,7 @@ docs/                    Scope, safety, and integration notes
 
 2. Install `userscript/gemhud.user.js` in Tampermonkey.
 
-3. Open a BGA base Splendor table.
+3. Open a BGA base Splendor table or `https://game.hullqin.cn/ccbs/...`.
 
 4. GemHUD will POST public card data to:
 
@@ -48,7 +48,8 @@ docs/                    Scope, safety, and integration notes
    http://127.0.0.1:8787/analyze
    ```
 
-5. The script renders value badges on detected visible cards.
+5. The script renders value badges on detected visible cards and shows a
+   values-only action suggestion in the panel.
 
 ## Rust Advisor Executable
 
@@ -79,18 +80,19 @@ target\release\gemhud-advisor.exe \
   --simulations 96
 ```
 
-This native mode still depends on a BGA public-state mapper for exact live-table
-accuracy. Until that mapper is complete, GemHUD maps visible base-card slots to
-DinoBoard root action values and falls back to the public-card heuristic when a
-card cannot be mapped.
+When the userscript can read BGA `gameui.gamedatas` or HullQin ccbs DOM state,
+native mode maps the public base Splendor state into DinoBoard before running
+MCTS: bank tokens, player tokens and bonuses, visible market cards, nobles, deck
+sizes, current player, and public reserve visibility. It still falls back to the
+public-card heuristic when the table is an unsupported expansion or a card
+cannot be mapped.
 
 ## Current Status
 
-This initial version establishes the browser-to-local-advisor bridge and the
+The current version establishes the browser-to-local-advisor bridge and the
 values-only UI guardrails. The default advisor computes public-card feature
-values and exposes a stable `/analyze` response shape. A DinoBoard-backed MCTS
-adapter can replace the scoring method after the BGA base Splendor public state
-mapper is validated against live BGA payloads.
+values, while the Rust `dinoboard-native` mode can use a mapped BGA base
+Splendor snapshot and DinoBoard MCTS root action values.
 
 ## Advisor API
 
@@ -109,7 +111,8 @@ Accepts public BGA card information:
   "capabilities": {
     "values_only": true,
     "automation": false,
-    "base_splendor_only": true
+    "base_splendor_only": true,
+    "action_recommendation": true
   },
   "cards": [
     {
@@ -119,7 +122,13 @@ Accepts public BGA card information:
       "bonus_color": "blue",
       "cost": {"white": 1, "green": 2}
     }
-  ]
+  ],
+  "recommendation": {
+    "label": "拿宝石 W U G",
+    "value": 0.56,
+    "confidence": 0.62,
+    "method": "state-aware-heuristic-v1"
+  }
 }
 ```
 
