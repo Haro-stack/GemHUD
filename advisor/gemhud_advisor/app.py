@@ -79,6 +79,17 @@ class CardValue(BaseModel):
     method: str
     label: str
     reasons: list[str] = Field(default_factory=list)
+    self_status: "CardPurchaseStatus | None" = None
+    opponent_status: "CardPurchaseStatus | None" = None
+
+
+class CardPurchaseStatus(BaseModel):
+    can_buy_now: bool
+    turns_to_buy: int
+    token_deficit: int
+    gold_used: int
+    player_index: int | None = None
+    label: str
 
 
 class ActionRecommendation(BaseModel):
@@ -226,8 +237,10 @@ def score_card(card: CardInput, snapshot: dict[str, Any] | None = None) -> CardV
 
     method = "public-card-heuristic-v0"
     confidence = card_confidence(card)
+    self_status = None
+    opponent_status = None
     if snapshot:
-        adjustment, snapshot_reasons = state_adjustment(card, snapshot)
+        adjustment, snapshot_reasons, self_status, opponent_status = state_adjustment(card, snapshot)
         score += adjustment
         reasons.extend(snapshot_reasons)
         method = "bga-state-aware-heuristic-v1"
@@ -242,35 +255,71 @@ def score_card(card: CardInput, snapshot: dict[str, Any] | None = None) -> CardV
         method=method,
         label=label,
         reasons=reasons[:6],
+        self_status=self_status,
+        opponent_status=opponent_status,
     )
 
 
-def state_adjustment(card: CardInput, snapshot: dict[str, Any]) -> tuple[float, list[str]]:
+def state_adjustment(
+    card: CardInput,
+    snapshot: dict[str, Any],
+) -> tuple[float, list[str], CardPurchaseStatus | None, CardPurchaseStatus | None]:
     player = current_snapshot_player(snapshot)
     if not player:
-        return 0.0, ["snapshot missing active player"]
+        return 0.0, ["snapshot missing active player"], None, None
+    players = snapshot.get("players") if isinstance(snapshot.get("players"), list) else []
+    current = int(snapshot.get("current_player") or 0)
+    bank = int_list(snapshot.get("bank"), 6)
     gems = int_list(player.get("tokens"), 6)
     bonuses = int_list(player.get("bonuses"), 5)
     cost = [int(card.cost.get(color, 0)) for color in COLORS]
     deficit, gold_used = payment_deficit(cost, bonuses, gems)
+    self_status = purchase_status_for_player(card, player, bank, current)
+    opponent_status = best_opponent_purchase_status(card, players, bank, current)
+    self_noble = noble_route_score_for_bonuses(card, snapshot, bonuses)
+    opponent_noble = best_opponent_noble_route_score(card, snapshot, current)
     adjustment = 0.0
     reasons: list[str] = []
-    if deficit == 0:
-        adjustment += 0.16
+    if self_status.can_buy_now:
+        adjustment += 0.17
         reasons.append(f"buyable now using {gold_used} gold" if gold_used else "buyable now")
-    elif deficit <= 2:
+    elif self_status.turns_to_buy == 1:
+        adjustment += 0.10
+        reasons.append(f"{deficit} token short; about 1 turn")
+    elif self_status.turns_to_buy == 2:
         adjustment += 0.06
-        reasons.append(f"{deficit} token short")
+        reasons.append(f"{deficit} tokens short; about 2 turns")
     else:
-        adjustment -= min(0.18, deficit * 0.035)
-        reasons.append(f"{deficit} tokens short")
-    if opponent_can_buy(card, snapshot):
-        adjustment += 0.04
-        reasons.append("opponent can buy")
-    if advances_visible_noble(card, snapshot, bonuses):
-        adjustment += 0.05
-        reasons.append("helps visible noble")
-    return adjustment, reasons
+        adjustment -= min(0.16, self_status.turns_to_buy * 0.025)
+        reasons.append(f"{deficit} tokens short; about {self_status.turns_to_buy} turns")
+    if opponent_status:
+        if opponent_status.can_buy_now:
+            adjustment += 0.08
+            reasons.append("opponent can buy now +0.5 pressure")
+        elif opponent_status.turns_to_buy <= 1:
+            adjustment += 0.05
+            reasons.append("opponent can reach in 1 turn")
+        if opponent_status.turns_to_buy < self_status.turns_to_buy:
+            adjustment += 0.07
+            reasons.append("opponent reaches earlier +0.5 contest")
+        elif self_status.turns_to_buy < opponent_status.turns_to_buy:
+            adjustment += 0.04
+            reasons.append("we reach earlier")
+    if self_noble > 0:
+        adjustment += self_noble * 0.12
+        reasons.append(f"helps our noble route +{self_noble:.2f}")
+    if opponent_noble > 0:
+        adjustment += opponent_noble * 0.09
+        reasons.append(f"blocks opponent noble route +{opponent_noble:.2f}")
+    cost_total = sum(cost)
+    points = int(card.points or 0)
+    if points >= 3 and cost_total <= 7:
+        adjustment += 0.10
+        reasons.append("high points for low cost +1.0")
+    elif points > 0 and cost_total > 0:
+        adjustment += min(0.08, (points / cost_total) * 0.10)
+        reasons.append("prestige efficiency")
+    return adjustment, reasons, self_status, opponent_status
 
 
 def current_snapshot_player(snapshot: dict[str, Any]) -> dict[str, Any] | None:
@@ -307,6 +356,112 @@ def payment_deficit(cost: list[int], bonuses: list[int], gems: list[int]) -> tup
         gold_used += covered
         deficit += short - covered
     return deficit, gold_used
+
+
+def payment_gap_by_color(cost: list[int], bonuses: list[int], gems: list[int]) -> tuple[list[int], int]:
+    deficits = [max(0, cost[idx] - bonuses[idx] - gems[idx]) for idx in range(len(COLORS))]
+    gold_left = gems[5] if len(gems) > 5 else 0
+    gold_used = 0
+    while gold_left > 0 and max(deficits) > 0:
+        idx = max(range(len(deficits)), key=lambda i: deficits[i])
+        deficits[idx] -= 1
+        gold_left -= 1
+        gold_used += 1
+    return deficits, gold_used
+
+
+def purchase_status_for_player(
+    card: CardInput,
+    player: dict[str, Any],
+    bank: list[int],
+    player_index: int | None,
+) -> CardPurchaseStatus:
+    cost = [int(card.cost.get(color, 0)) for color in COLORS]
+    bonuses = int_list(player.get("bonuses"), 5)
+    gems = int_list(player.get("tokens"), 6)
+    deficits, gold_used = payment_gap_by_color(cost, bonuses, gems)
+    token_deficit = sum(deficits)
+    turns = min_turns_to_cover_deficits(deficits, bank)
+    can_buy_now = token_deficit == 0
+    return CardPurchaseStatus(
+        can_buy_now=can_buy_now,
+        turns_to_buy=turns,
+        token_deficit=token_deficit,
+        gold_used=gold_used,
+        player_index=player_index,
+        label="now" if can_buy_now else f"{turns}T / -{token_deficit}",
+    )
+
+
+def min_turns_to_cover_deficits(deficits: list[int], bank: list[int]) -> int:
+    total = sum(deficits)
+    if total <= 0:
+        return 0
+    turns = (total + 2) // 3
+    for idx, deficit in enumerate(deficits):
+        if deficit <= 0:
+            continue
+        per_color = (deficit + 1) // 2 if idx < len(bank) and bank[idx] >= 4 else deficit
+        turns = max(turns, per_color)
+    return max(1, turns)
+
+
+def best_opponent_purchase_status(
+    card: CardInput,
+    players: list[Any],
+    bank: list[int],
+    current: int,
+) -> CardPurchaseStatus | None:
+    statuses = [
+        purchase_status_for_player(card, player, bank, idx)
+        for idx, player in enumerate(players)
+        if idx != current and isinstance(player, dict)
+    ]
+    if not statuses:
+        return None
+    return min(statuses, key=lambda status: (status.turns_to_buy, status.token_deficit))
+
+
+def noble_route_score_for_bonuses(card: CardInput, snapshot: dict[str, Any], bonuses: list[int]) -> float:
+    if card.bonus_color not in COLORS:
+        return 0.0
+    color = COLORS.index(card.bonus_color)
+    nobles = snapshot.get("nobles")
+    if not isinstance(nobles, list):
+        return 0.0
+    best = 0.0
+    for noble in nobles:
+        if not isinstance(noble, dict):
+            continue
+        req = int_list(noble.get("requirements"), 5)
+        if req[color] <= bonuses[color]:
+            continue
+        before = sum(max(0, needed - bonuses[idx]) for idx, needed in enumerate(req))
+        if before <= 0:
+            continue
+        after = before - 1
+        if after == 0:
+            score = 1.0
+        elif before <= 3:
+            score = 0.75
+        elif before <= 5:
+            score = 0.45
+        else:
+            score = 0.20
+        best = max(best, score)
+    return best
+
+
+def best_opponent_noble_route_score(card: CardInput, snapshot: dict[str, Any], current: int) -> float:
+    players = snapshot.get("players")
+    if not isinstance(players, list):
+        return 0.0
+    best = 0.0
+    for idx, player in enumerate(players):
+        if idx == current or not isinstance(player, dict):
+            continue
+        best = max(best, noble_route_score_for_bonuses(card, snapshot, int_list(player.get("bonuses"), 5)))
+    return best
 
 
 def opponent_can_buy(card: CardInput, snapshot: dict[str, Any]) -> bool:

@@ -120,6 +120,21 @@ struct CardValue {
     method: String,
     label: String,
     reasons: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    self_status: Option<CardPurchaseStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    opponent_status: Option<CardPurchaseStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CardPurchaseStatus {
+    can_buy_now: bool,
+    turns_to_buy: i64,
+    token_deficit: i64,
+    gold_used: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    player_index: Option<usize>,
+    label: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -828,7 +843,7 @@ fn score_cards_with_dinoboard(
         Ok(NativeAnalysis {
             cards: cards
                 .iter()
-                .map(|card| score_card_with_dinoboard(card, &parsed))
+                .map(|card| score_card_with_dinoboard(card, &parsed, snapshot))
                 .collect(),
             recommendations: recommend_actions_from_root(&parsed, 3),
         })
@@ -849,7 +864,11 @@ fn model_path_for_game(configured_model: &Path, game_id: &str) -> PathBuf {
         .unwrap_or_else(|| configured_model.to_path_buf())
 }
 
-fn score_card_with_dinoboard(card: &CardInput, root: &Value) -> CardValue {
+fn score_card_with_dinoboard(
+    card: &CardInput,
+    root: &Value,
+    snapshot: Option<&Value>,
+) -> CardValue {
     let buy = card
         .buy_action_id
         .and_then(|id| root_action_value(root, id))
@@ -858,31 +877,29 @@ fn score_card_with_dinoboard(card: &CardInput, root: &Value) -> CardValue {
         .reserve_action_id
         .and_then(|id| root_action_value(root, id))
         .map(|v| ("reserve", card.reserve_action_id.unwrap(), v));
+    let mut scored = snapshot
+        .map(|snapshot| score_card_with_snapshot(card, snapshot))
+        .unwrap_or_else(|| score_card(card));
     if let Some((kind, action_id, raw_value)) = best_action_value(buy, reserve) {
-        let value = clamp_f64((raw_value + 1.0) / 2.0, 0.0, 1.0);
-        return CardValue {
-            client_id: card.client_id.clone(),
-            value,
-            confidence: if card.market_index.is_some() {
-                0.75
-            } else {
-                0.55
-            },
-            method: "dinoboard-c-abi-root-action-value-v0".to_string(),
-            label: value_label(value).to_string(),
-            reasons: vec![
-                format!("{kind} action {action_id}"),
-                format!("root value {raw_value:.3}"),
-                "values only".to_string(),
-            ],
-        };
+        let root_value = clamp_f64((raw_value + 1.0) / 2.0, 0.0, 1.0);
+        scored.value = clamp_f64(scored.value * 0.78 + root_value * 0.22, 0.0, 1.0);
+        scored.confidence = scored.confidence.max(if card.market_index.is_some() {
+            0.88
+        } else {
+            0.65
+        });
+        scored.method = "strategic-heuristic-plus-dinoboard-v1".to_string();
+        scored.label = value_label(scored.value).to_string();
+        scored.reasons.push(format!("{kind} action {action_id}"));
+        scored.reasons.push(format!("root value {raw_value:.3}"));
+        scored.reasons.truncate(10);
+        return scored;
     }
-    let mut fallback = score_card(card);
-    fallback.method = "public-card-heuristic-v0-no-dinoboard-action".to_string();
-    fallback
+    scored.method = "strategic-heuristic-v1-no-dinoboard-action".to_string();
+    scored
         .reasons
         .push("no mapped DinoBoard action".to_string());
-    fallback
+    scored
 }
 
 fn best_action_value(
@@ -1698,6 +1715,11 @@ fn append_snapshot_warnings(snapshot: &Value, warnings: &mut Vec<String>) {
 
 fn score_card_with_snapshot(card: &CardInput, snapshot: &Value) -> CardValue {
     let mut scored = score_card(card);
+    let current = snapshot
+        .get("current_player")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0) as usize;
     let Some(player) = current_snapshot_player(snapshot) else {
         scored
             .reasons
@@ -1709,11 +1731,18 @@ fn score_card_with_snapshot(card: &CardInput, snapshot: &Value) -> CardValue {
     let bonuses = value_i64_array(player.get("bonuses"), 5);
     let cost = card_cost_vector(card);
     let (deficit, gold_used) = payment_deficit(&cost, &bonuses, &gems);
+    let bank = value_i64_array(snapshot.get("bank"), 6);
+    let self_status = purchase_status_for_player(card, player, &bank, Some(current));
+    let opponent_status = best_opponent_purchase_status(card, snapshot, &bank, current);
+    let self_noble = noble_route_score_for_bonuses(card, snapshot, &bonuses);
+    let opponent_noble = best_opponent_noble_route_score(card, snapshot, current);
+    let cost_total: i64 = cost.iter().sum();
+    let points = card.points.unwrap_or(0).max(0);
 
     scored.method = "bga-state-aware-heuristic-v1".to_string();
     scored.confidence = scored.confidence.max(0.9);
-    if deficit == 0 {
-        scored.value += 0.16;
+    if self_status.can_buy_now {
+        scored.value += 0.17;
         if gold_used > 0 {
             scored
                 .reasons
@@ -1721,27 +1750,75 @@ fn score_card_with_snapshot(card: &CardInput, snapshot: &Value) -> CardValue {
         } else {
             scored.reasons.push("buyable now".to_string());
         }
-    } else if deficit <= 2 {
+    } else if self_status.turns_to_buy == 1 {
+        scored.value += 0.10;
+        scored
+            .reasons
+            .push(format!("{deficit} token short; about 1 turn"));
+    } else if self_status.turns_to_buy == 2 {
         scored.value += 0.06;
-        scored.reasons.push(format!("{deficit} token short"));
+        scored
+            .reasons
+            .push(format!("{deficit} tokens short; about 2 turns"));
     } else {
-        let penalty = (deficit as f64 * 0.035).min(0.18);
+        let penalty = (self_status.turns_to_buy as f64 * 0.025).min(0.16);
         scored.value -= penalty;
-        scored.reasons.push(format!("{deficit} tokens short"));
+        scored.reasons.push(format!(
+            "{deficit} tokens short; about {} turns",
+            self_status.turns_to_buy
+        ));
     }
 
-    if opponent_can_buy(card, snapshot) {
-        scored.value += 0.04;
-        scored.reasons.push("opponent can buy".to_string());
+    if let Some(status) = &opponent_status {
+        if status.can_buy_now {
+            scored.value += 0.08;
+            scored
+                .reasons
+                .push("opponent can buy now +0.5 pressure".to_string());
+        } else if status.turns_to_buy <= 1 {
+            scored.value += 0.05;
+            scored
+                .reasons
+                .push("opponent can reach in 1 turn".to_string());
+        }
+        if status.turns_to_buy < self_status.turns_to_buy {
+            scored.value += 0.07;
+            scored
+                .reasons
+                .push("opponent reaches earlier +0.5 contest".to_string());
+        } else if self_status.turns_to_buy < status.turns_to_buy {
+            scored.value += 0.04;
+            scored.reasons.push("we reach earlier".to_string());
+        }
     }
-    if advances_visible_noble(card, snapshot, &bonuses) {
-        scored.value += 0.05;
-        scored.reasons.push("helps visible noble".to_string());
+
+    if self_noble > 0.0 {
+        scored.value += self_noble * 0.12;
+        scored
+            .reasons
+            .push(format!("helps our noble route +{self_noble:.2}"));
+    }
+    if opponent_noble > 0.0 {
+        scored.value += opponent_noble * 0.09;
+        scored
+            .reasons
+            .push(format!("blocks opponent noble route +{opponent_noble:.2}"));
+    }
+    if points >= 3 && cost_total <= 7 {
+        scored.value += 0.10;
+        scored
+            .reasons
+            .push("high points for low cost +1.0".to_string());
+    } else if points > 0 && cost_total > 0 {
+        scored.value += ((points as f64 / cost_total as f64) * 0.10).min(0.08);
+        scored.reasons.push("prestige efficiency".to_string());
     }
 
     scored.value = clamp_f64(scored.value, 0.0, 1.0);
     scored.label = value_label(scored.value).to_string();
-    scored.reasons.truncate(6);
+    scored.self_status = Some(self_status);
+    scored.opponent_status = opponent_status;
+    scored.reasons.truncate(10);
     scored
 }
 
@@ -1797,54 +1874,162 @@ fn payment_deficit(cost: &[i64], bonuses: &[i64], gems: &[i64]) -> (i64, i64) {
     (deficit, gold_used)
 }
 
-fn opponent_can_buy(card: &CardInput, snapshot: &Value) -> bool {
-    let current = snapshot
-        .get("current_player")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let cost = card_cost_vector(card);
-    snapshot
-        .get("players")
-        .and_then(Value::as_array)
-        .map(|players| {
-            players.iter().enumerate().any(|(idx, player)| {
-                idx as i64 != current && {
-                    let gems = value_i64_array(player.get("tokens"), 6);
-                    let bonuses = value_i64_array(player.get("bonuses"), 5);
-                    payment_deficit(&cost, &bonuses, &gems).0 == 0
-                }
-            })
+fn payment_gap_by_color(cost: &[i64], bonuses: &[i64], gems: &[i64]) -> (Vec<i64>, i64) {
+    let mut deficits: Vec<i64> = (0..COLORS.len())
+        .map(|color| {
+            let need = (cost.get(color).copied().unwrap_or(0)
+                - bonuses.get(color).copied().unwrap_or(0))
+            .max(0);
+            (need - gems.get(color).copied().unwrap_or(0)).max(0)
         })
-        .unwrap_or(false)
+        .collect();
+    let mut gold_left = gems.get(5).copied().unwrap_or(0).max(0);
+    let mut gold_used = 0;
+    while gold_left > 0 {
+        let Some((idx, amount)) = deficits
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by_key(|(_, amount)| *amount)
+        else {
+            break;
+        };
+        if amount <= 0 {
+            break;
+        }
+        deficits[idx] -= 1;
+        gold_left -= 1;
+        gold_used += 1;
+    }
+    (deficits, gold_used)
 }
 
-fn advances_visible_noble(card: &CardInput, snapshot: &Value, bonuses: &[i64]) -> bool {
+fn purchase_status_for_player(
+    card: &CardInput,
+    player: &Value,
+    bank: &[i64],
+    player_index: Option<usize>,
+) -> CardPurchaseStatus {
+    let cost = card_cost_vector(card);
+    let bonuses = value_i64_array(player.get("bonuses"), 5);
+    let gems = value_i64_array(player.get("tokens"), 6);
+    let (deficits, gold_used) = payment_gap_by_color(&cost, &bonuses, &gems);
+    let token_deficit: i64 = deficits.iter().sum();
+    let turns_to_buy = min_turns_to_cover_deficits(&deficits, bank);
+    let can_buy_now = token_deficit == 0;
+    CardPurchaseStatus {
+        can_buy_now,
+        turns_to_buy,
+        token_deficit,
+        gold_used,
+        player_index,
+        label: if can_buy_now {
+            "now".to_string()
+        } else {
+            format!("{turns_to_buy}T / -{token_deficit}")
+        },
+    }
+}
+
+fn min_turns_to_cover_deficits(deficits: &[i64], bank: &[i64]) -> i64 {
+    let total: i64 = deficits.iter().sum();
+    if total <= 0 {
+        return 0;
+    }
+    let mut turns = (total + 2) / 3;
+    for (idx, deficit) in deficits.iter().copied().enumerate() {
+        if deficit <= 0 {
+            continue;
+        }
+        let per_color = if bank.get(idx).copied().unwrap_or(0) >= 4 {
+            (deficit + 1) / 2
+        } else {
+            deficit
+        };
+        turns = turns.max(per_color);
+    }
+    turns.max(1)
+}
+
+fn best_opponent_purchase_status(
+    card: &CardInput,
+    snapshot: &Value,
+    bank: &[i64],
+    current: usize,
+) -> Option<CardPurchaseStatus> {
+    snapshot
+        .get("players")
+        .and_then(Value::as_array)?
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| *idx != current)
+        .map(|(idx, player)| purchase_status_for_player(card, player, bank, Some(idx)))
+        .min_by_key(|status| (status.turns_to_buy, status.token_deficit))
+}
+
+fn noble_route_score_for_bonuses(card: &CardInput, snapshot: &Value, bonuses: &[i64]) -> f64 {
     let Some(color) = card
         .bonus_color
         .as_ref()
         .and_then(|color| COLORS.iter().position(|known| known == color))
     else {
-        return false;
+        return 0.0;
     };
     snapshot
         .get("nobles")
         .and_then(Value::as_array)
         .map(|nobles| {
-            nobles.iter().any(|noble| {
-                let req = value_i64_array(noble.get("requirements"), 5);
-                if req.get(color).copied().unwrap_or(0) <= bonuses.get(color).copied().unwrap_or(0)
-                {
-                    return false;
-                }
-                let missing_before: i64 = req
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, needed)| (needed - bonuses.get(idx).copied().unwrap_or(0)).max(0))
-                    .sum();
-                missing_before <= 5
-            })
+            nobles
+                .iter()
+                .map(|noble| {
+                    let req = value_i64_array(noble.get("requirements"), 5);
+                    if req.get(color).copied().unwrap_or(0)
+                        <= bonuses.get(color).copied().unwrap_or(0)
+                    {
+                        return 0.0;
+                    }
+                    let before: i64 = req
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, needed)| {
+                            (needed - bonuses.get(idx).copied().unwrap_or(0)).max(0)
+                        })
+                        .sum();
+                    if before <= 0 {
+                        return 0.0;
+                    }
+                    let after = before - 1;
+                    if after == 0 {
+                        1.0
+                    } else if before <= 3 {
+                        0.75
+                    } else if before <= 5 {
+                        0.45
+                    } else {
+                        0.20
+                    }
+                })
+                .fold(0.0, f64::max)
         })
-        .unwrap_or(false)
+        .unwrap_or(0.0)
+}
+
+fn best_opponent_noble_route_score(card: &CardInput, snapshot: &Value, current: usize) -> f64 {
+    snapshot
+        .get("players")
+        .and_then(Value::as_array)
+        .map(|players| {
+            players
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| *idx != current)
+                .map(|(_, player)| {
+                    let bonuses = value_i64_array(player.get("bonuses"), 5);
+                    noble_route_score_for_bonuses(card, snapshot, &bonuses)
+                })
+                .fold(0.0, f64::max)
+        })
+        .unwrap_or(0.0)
 }
 
 fn score_card(card: &CardInput) -> CardValue {
@@ -1932,6 +2117,8 @@ fn score_card(card: &CardInput) -> CardValue {
         method: "public-card-heuristic-v0".to_string(),
         label: value_label(value).to_string(),
         reasons: reasons.into_iter().take(5).collect(),
+        self_status: None,
+        opponent_status: None,
     }
 }
 

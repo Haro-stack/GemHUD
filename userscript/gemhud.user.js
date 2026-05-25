@@ -539,6 +539,34 @@
     return lines.join("\n");
   }
 
+  function statusTurns(status) {
+    if (!status) return "?";
+    if (status.can_buy_now) return "0T";
+    const turns = Number(status.turns_to_buy);
+    return Number.isFinite(turns) ? `${turns}T` : "?";
+  }
+
+  function compactStatusSummary(item) {
+    const self = item && item.self_status;
+    const opponent = item && item.opponent_status;
+    if (!self && !opponent) return "";
+    return `我${statusTurns(self)} / 敌${statusTurns(opponent)}`;
+  }
+
+  function verboseStatusSummary(item) {
+    const lines = [];
+    const self = item && item.self_status;
+    const opponent = item && item.opponent_status;
+    if (self) {
+      lines.push(`Our buy status: ${self.label}; deficit ${self.token_deficit}; gold ${self.gold_used}`);
+    }
+    if (opponent) {
+      const player = Number.isFinite(Number(opponent.player_index)) ? ` P${Number(opponent.player_index) + 1}` : "";
+      lines.push(`Opponent${player} buy status: ${opponent.label}; deficit ${opponent.token_deficit}; gold ${opponent.gold_used}`);
+    }
+    return lines.join("\n");
+  }
+
   function toInt(value, fallback = 0) {
     const n = Number.parseInt(String(value == null ? "" : value), 10);
     return Number.isFinite(n) ? n : fallback;
@@ -1283,6 +1311,7 @@
         `GemHUD value ${pct}/100`,
         `Method: ${item.method || "local advisor"}`,
         verboseCardSummary(meta),
+        verboseStatusSummary(item),
         ...(Array.isArray(item.reasons) ? item.reasons : []),
         "Values only; no automation.",
       ].filter(Boolean).join("\n");
@@ -1290,8 +1319,8 @@
       if (meta) {
         const metaBadge = document.createElement("div");
         metaBadge.className = META_CLASS;
-        metaBadge.textContent = compactCardSummary(meta);
-        metaBadge.title = verboseCardSummary(meta);
+        metaBadge.textContent = compactStatusSummary(item) || compactCardSummary(meta);
+        metaBadge.title = [verboseCardSummary(meta), verboseStatusSummary(item)].filter(Boolean).join("\n");
         el.appendChild(metaBadge);
       }
       rendered += 1;
